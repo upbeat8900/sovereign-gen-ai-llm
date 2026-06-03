@@ -1,0 +1,12 @@
+.git
+__pycache__
+*.pyc
+data
+frontend/dist
+frontend/node_modules
+history
+venv
+gpt-stories
+openai_key.txt
+scratch.ipynb
+Transformer_main_paper.pdf

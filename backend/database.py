@@ -1,0 +1,242 @@
+import os
+import re
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator, Optional
+
+
+DATA_DIR = Path(os.getenv("CHAT_DATA_DIR", Path(__file__).resolve().parent.parent / "data"))
+DB_PATH = DATA_DIR / "chat.db"
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful local assistant. Use the conversation memory bank "
+    "when it is relevant, and be clear when you are unsure."
+)
+
+
+def _default_base_url() -> str:
+    return os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+
+
+def _default_model() -> str:
+    return os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+
+
+def generate_memory_title(content: str) -> str:
+    first_line = next((line.strip() for line in content.splitlines() if line.strip()), "")
+    text = re.sub(r"[#*_`>\[\]()]|https?://\S+", " ", first_line or content)
+    text = re.sub(r"\s+", " ", text).strip()
+    words = text.split()[:9]
+    title = " ".join(words).strip(" .,:;-")
+    if not title:
+        return "Untitled memory"
+    if len(title) > 72:
+        return f"{title[:72].rstrip()}..."
+    return title
+
+
+@contextmanager
+def get_connection() -> Iterator[sqlite3.Connection]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA journal_mode = WAL")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_db() -> None:
+    with get_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                llm_model_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant')),
+                content TEXT NOT NULL,
+                llm_provider TEXT,
+                llm_model TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_message_id INTEGER,
+                llm_provider TEXT,
+                llm_model TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                archived_at TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_message_id) REFERENCES messages(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                provider TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                model TEXT NOT NULL,
+                api_key TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                model TEXT NOT NULL,
+                api_key TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS speech_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                whisper_model TEXT NOT NULL DEFAULT 'base.en',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS app_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                default_prompt TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        _ensure_column(connection, "conversations", "sort_order", "INTEGER")
+        _ensure_column(connection, "conversations", "llm_model_id", "INTEGER")
+        _backfill_conversation_order(connection)
+        _ensure_column(connection, "messages", "llm_provider", "TEXT")
+        _ensure_column(connection, "messages", "llm_model", "TEXT")
+        _ensure_column(connection, "messages", "image_media_type", "TEXT")
+        _ensure_column(connection, "messages", "image_data", "TEXT")
+        _ensure_column(connection, "messages", "generation_ms", "INTEGER")
+        _ensure_column(connection, "messages", "include_history", "INTEGER")
+        _ensure_column(connection, "memories", "title", "TEXT")
+        _ensure_column(connection, "memories", "llm_provider", "TEXT")
+        _ensure_column(connection, "memories", "llm_model", "TEXT")
+        _ensure_column(connection, "memories", "archived_at", "TEXT")
+        _ensure_column(connection, "llm_models", "comments", "TEXT")
+        _backfill_memory_titles(connection)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO llm_config (id, provider, base_url, model, api_key)
+            VALUES (1, 'ollama', ?, ?, NULL)
+            """,
+            (_default_base_url(), _default_model()),
+        )
+        _seed_llm_models(connection)
+        _backfill_conversation_models(connection)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO speech_config (id, whisper_model)
+            VALUES (1, ?)
+            """,
+            (os.getenv("WHISPER_MODEL", "base.en"),),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO app_config (id, default_prompt)
+            VALUES (1, ?)
+            """,
+            (DEFAULT_SYSTEM_PROMPT,),
+        )
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def _backfill_memory_titles(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT id, content FROM memories WHERE title IS NULL OR TRIM(title) = ''"
+    ).fetchall()
+    for row in rows:
+        connection.execute(
+            "UPDATE memories SET title = ? WHERE id = ?",
+            (generate_memory_title(row["content"]), row["id"]),
+        )
+
+
+def _backfill_conversation_order(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT id FROM conversations
+        WHERE sort_order IS NULL OR sort_order = 0
+        ORDER BY updated_at DESC, id DESC
+        """
+    ).fetchall()
+    for index, row in enumerate(rows):
+        connection.execute("UPDATE conversations SET sort_order = ? WHERE id = ?", (index, row["id"]))
+
+
+def _backfill_conversation_models(connection: sqlite3.Connection) -> None:
+    active_model = connection.execute(
+        "SELECT id FROM llm_models WHERE is_active = 1 ORDER BY id LIMIT 1"
+    ).fetchone()
+    if active_model:
+        connection.execute(
+            "UPDATE conversations SET llm_model_id = ? WHERE llm_model_id IS NULL",
+            (active_model["id"],),
+        )
+
+
+def _seed_llm_models(connection: sqlite3.Connection) -> None:
+    count = connection.execute("SELECT COUNT(*) AS count FROM llm_models").fetchone()["count"]
+    if count == 0:
+        legacy = connection.execute("SELECT * FROM llm_config WHERE id = 1").fetchone()
+        if legacy:
+            connection.execute(
+                """
+                INSERT INTO llm_models (provider, base_url, model, api_key, is_active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (legacy["provider"], legacy["base_url"], legacy["model"], legacy["api_key"]),
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO llm_models (provider, base_url, model, api_key, is_active)
+                VALUES ('ollama', ?, ?, NULL, 1)
+                """,
+                (_default_base_url(), _default_model()),
+            )
+        return
+
+    active_count = connection.execute(
+        "SELECT COUNT(*) AS count FROM llm_models WHERE is_active = 1"
+    ).fetchone()["count"]
+    if active_count == 0:
+        first_model = connection.execute("SELECT id FROM llm_models ORDER BY id LIMIT 1").fetchone()
+        connection.execute("UPDATE llm_models SET is_active = 1 WHERE id = ?", (first_model["id"],))
+
+
+def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
+    if row is None:
+        return None
+    return dict(row)

@@ -1,0 +1,11 @@
+/history
+/__pycache__
+**/__pycache__/
+*.pyc
+/gpt-stories
+/venv
+openai_key.txt
+bash
+/data
+/frontend/node_modules
+/frontend/dist

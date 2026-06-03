@@ -1,0 +1,19 @@
+services:
+  chat:
+    build: .
+    ports:
+      - "8087:8087"
+    environment:
+      CHAT_DATA_DIR: /app/data
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: qwen3.5:9b
+      WHISPER_MODEL: base.en
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+    volumes:
+      - chat-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  chat-data:
