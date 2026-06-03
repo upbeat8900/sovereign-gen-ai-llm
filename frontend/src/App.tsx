@@ -13,7 +13,6 @@ import {
   Brain,
   Check,
   FileDown,
-  History,
   ImagePlus,
   Loader2,
   MessageCircle,
@@ -94,6 +93,7 @@ type LlmModel = {
   model: string;
   comments?: string;
   has_api_key?: boolean;
+  api_key_preview?: string | null;
   is_active: boolean;
   updated_at?: string;
   api_key?: string;
@@ -147,6 +147,40 @@ const TTS_RATE_STORAGE_KEY = "tts_speech_rate";
 const CURRENT_MESSAGE_ONLY_STORAGE_KEY = "chat_current_message_only";
 const HISTORY_MESSAGE_LIMIT_STORAGE_KEY = "chat_history_message_limit";
 const HISTORY_FULL_SENTINEL = -1;
+const LLM_HISTORY_DB_CAP = 40;
+
+function llmContextOverhead(memoryCount: number) {
+  return 1 + (memoryCount > 0 ? 1 : 0);
+}
+
+function historySliderMin(overhead: number) {
+  return overhead + 1;
+}
+
+function historySliderMax(overhead: number, dbMessageCount: number) {
+  const cappedDb = Math.min(dbMessageCount, LLM_HISTORY_DB_CAP);
+  return overhead + cappedDb + 1;
+}
+
+function dbLimitFromHistorySliderTotal(total: number, overhead: number, dbMessageCount: number) {
+  const cappedDb = Math.min(dbMessageCount, LLM_HISTORY_DB_CAP);
+  return Math.max(0, Math.min(cappedDb, total - overhead - 1));
+}
+
+function historyLimitToIncludeHistory(sliderTotal: number, overhead: number, dbMessageCount: number): boolean | number {
+  const dbLimit = dbLimitFromHistorySliderTotal(sliderTotal, overhead, dbMessageCount);
+  if (dbLimit <= 0) {
+    return false;
+  }
+  const cappedDb = Math.min(dbMessageCount, LLM_HISTORY_DB_CAP);
+  if (cappedDb <= 0) {
+    return false;
+  }
+  if (dbLimit >= cappedDb) {
+    return true;
+  }
+  return dbLimit;
+}
 
 function readStoredHistoryMessageLimit(): number {
   const stored = localStorage.getItem(HISTORY_MESSAGE_LIMIT_STORAGE_KEY);
@@ -162,14 +196,27 @@ function readStoredHistoryMessageLimit(): number {
   return HISTORY_FULL_SENTINEL;
 }
 
-function historyLimitToIncludeHistory(limit: number, max: number): boolean | number {
-  if (limit <= 0 || max <= 0) {
-    return false;
+function migrateStoredHistoryContextTotal(
+  stored: number,
+  overhead: number,
+  min: number,
+  max: number,
+  dbMessageCount: number,
+) {
+  if (stored < 0) {
+    return max;
   }
-  if (limit >= max) {
-    return true;
+  if (stored >= min && stored <= max) {
+    return stored;
   }
-  return limit;
+  const cappedDb = Math.min(dbMessageCount, LLM_HISTORY_DB_CAP);
+  if (stored === 0) {
+    return min;
+  }
+  if (stored <= cappedDb) {
+    return Math.min(max, overhead + stored + 1);
+  }
+  return Math.min(max, Math.max(min, stored));
 }
 
 function persistHistoryMessageLimit(limit: number) {
@@ -177,26 +224,33 @@ function persistHistoryMessageLimit(limit: number) {
   localStorage.removeItem(CURRENT_MESSAGE_ONLY_STORAGE_KEY);
 }
 
-function clampHistoryMessageLimit(next: number, max: number) {
-  return Math.max(0, Math.min(max, next));
+function clampHistoryContextTotal(next: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, next));
 }
 
-function storedHistoryLimitFromComposerLimit(next: number, max: number) {
-  const clamped = clampHistoryMessageLimit(next, max);
-  if (max <= 0) {
-    return 0;
-  }
+function storedHistoryLimitFromContextTotal(next: number, min: number, max: number) {
+  const clamped = clampHistoryContextTotal(next, min, max);
   return clamped >= max ? HISTORY_FULL_SENTINEL : clamped;
 }
 
-function historyLimitTitle(limit: number, max: number) {
-  if (limit === 0) {
+function resolveHistoryContextTotal(stored: number, min: number, max: number) {
+  if (stored < 0 || stored > max) {
+    return max;
+  }
+  if (stored < min) {
+    return min;
+  }
+  return stored;
+}
+
+function historyLimitTitle(total: number, min: number, max: number) {
+  if (total <= min) {
     return "This message only";
   }
-  if (limit >= max) {
+  if (total >= max) {
     return "Full conversation history";
   }
-  return `Include ${limit} prior message${limit === 1 ? "" : "s"}`;
+  return `${total} messages in request`;
 }
 const TTS_RATE_MIN = 0.5;
 const TTS_RATE_MAX = 2;
@@ -253,6 +307,44 @@ function createAddModelDraft(isFirstModel: boolean): LlmModel {
     api_key: "",
     clear_api_key: false,
   };
+}
+
+function maskApiKey(value: string): string {
+  if (!value) return "";
+  if (value.length <= 6) return "*".repeat(value.length);
+  return `${value.slice(0, 3)}${"*".repeat(value.length - 6)}${value.slice(-3)}`;
+}
+
+type MaskedApiKeyInputProps = {
+  value: string;
+  preview?: string | null;
+  hasApiKey?: boolean;
+  placeholder?: string;
+  onChange: (value: string) => void;
+};
+
+function MaskedApiKeyInput({ value, preview, hasApiKey, placeholder, onChange }: MaskedApiKeyInputProps) {
+  const [focused, setFocused] = useState(false);
+  const displayValue = focused
+    ? value
+    : value
+      ? maskApiKey(value)
+      : hasApiKey && preview
+        ? preview
+        : "";
+
+  return (
+    <input
+      type="text"
+      value={displayValue}
+      placeholder={placeholder}
+      autoComplete="off"
+      spellCheck={false}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  );
 }
 
 function readBlobAsDataUrl(blob: Blob): Promise<string> {
@@ -477,6 +569,7 @@ export default function App() {
   const [newTitle, setNewTitle] = useState("");
   const [isNewConversationModalOpen, setIsNewConversationModalOpen] = useState(false);
   const [deleteConversationTarget, setDeleteConversationTarget] = useState<Conversation | null>(null);
+  const [deleteMessageCount, setDeleteMessageCount] = useState(0);
   const [deleteMemoryCount, setDeleteMemoryCount] = useState(0);
   const [deleteMemoryAction, setDeleteMemoryAction] = useState<"delete" | "move">("delete");
   const [deleteTargetId, setDeleteTargetId] = useState<number | "">("");
@@ -605,7 +698,6 @@ export default function App() {
       conversation.updated_at > latest.updated_at ? conversation : latest,
     );
   }, [conversations]);
-  const isOnLatestDiscussion = page === "chat" && latestConversation !== null && activeId === latestConversation.id;
   const deleteDestinationConversations = useMemo(
     () => conversations.filter((conversation) => conversation.id !== deleteConversationTarget?.id),
     [conversations, deleteConversationTarget?.id],
@@ -615,25 +707,35 @@ export default function App() {
     return config?.models.find((model) => model.id === modelId) ?? config?.active_model ?? null;
   }, [config, detail?.conversation.llm_model_id]);
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
-  const historyMessageMax = detail?.messages.length ?? 0;
-  const composerHistoryLimit =
-    historyMessageLimit < 0 || historyMessageLimit > historyMessageMax
-      ? historyMessageMax
-      : historyMessageLimit;
+  const historyContextOverhead = llmContextOverhead(detail?.memories.length ?? 0);
+  const historyDbMessageCount = detail?.messages.length ?? 0;
+  const historySliderMinValue = historySliderMin(historyContextOverhead);
+  const historySliderMaxValue = historySliderMax(historyContextOverhead, historyDbMessageCount);
+  const composerHistoryContextTotal = resolveHistoryContextTotal(
+    historyMessageLimit,
+    historySliderMinValue,
+    historySliderMaxValue,
+  );
 
   useEffect(() => {
     setHistoryMessageLimit((current) => {
-      if (current < 0 || current > historyMessageMax) {
-        return historyMessageMax;
-      }
-      return current;
+      const migrated = migrateStoredHistoryContextTotal(
+        current,
+        historyContextOverhead,
+        historySliderMinValue,
+        historySliderMaxValue,
+        historyDbMessageCount,
+      );
+      const resolved = resolveHistoryContextTotal(migrated, historySliderMinValue, historySliderMaxValue);
+      const stored = storedHistoryLimitFromContextTotal(resolved, historySliderMinValue, historySliderMaxValue);
+      return current === stored ? current : stored;
     });
-  }, [activeId, historyMessageMax]);
+  }, [activeId, historyContextOverhead, historyDbMessageCount, historySliderMinValue, historySliderMaxValue]);
 
   const historyControlsDisabled = !activeId || sending || isTranscribing;
 
   function updateHistoryMessageLimit(next: number) {
-    const stored = storedHistoryLimitFromComposerLimit(next, historyMessageMax);
+    const stored = storedHistoryLimitFromContextTotal(next, historySliderMinValue, historySliderMaxValue);
     setHistoryMessageLimit(stored);
     persistHistoryMessageLimit(stored);
   }
@@ -1198,42 +1300,61 @@ export default function App() {
 
   async function openDeleteConversationModal(conversation: Conversation) {
     setError("");
-    const conversationDetail = await request<ConversationDetail>(`/api/conversations/${conversation.id}`);
     const destinations = conversations.filter((candidate) => candidate.id !== conversation.id);
+    const cachedDetail = detail?.conversation.id === conversation.id ? detail : null;
     setDeleteConversationTarget(conversation);
-    setDeleteMemoryCount(conversationDetail.memories.length);
-    setDeleteMemoryAction(conversationDetail.memories.length > 0 && destinations.length > 0 ? "move" : "delete");
+    setDeleteMessageCount(cachedDetail ? cachedDetail.messages.filter((message) => message.id >= 0).length : 0);
+    setDeleteMemoryCount(cachedDetail?.memories.length ?? 0);
+    setDeleteMemoryAction(
+      (cachedDetail?.memories.length ?? 0) > 0 && destinations.length > 0 ? "move" : "delete",
+    );
     setDeleteTargetId(destinations[0]?.id ?? "");
+
+    try {
+      const conversationDetail = await request<ConversationDetail>(`/api/conversations/${conversation.id}`);
+      setDeleteMessageCount(conversationDetail.messages.filter((message) => message.id >= 0).length);
+      setDeleteMemoryCount(conversationDetail.memories.length);
+      setDeleteMemoryAction(conversationDetail.memories.length > 0 && destinations.length > 0 ? "move" : "delete");
+      setDeleteTargetId(destinations[0]?.id ?? "");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load conversation details");
+    }
   }
 
   async function confirmDeleteConversation(event: FormEvent) {
     event.preventDefault();
     if (!deleteConversationTarget) return;
 
-    await request(`/api/conversations/${deleteConversationTarget.id}/delete`, {
-      method: "POST",
-      body: JSON.stringify({
-        memory_action: deleteMemoryAction,
-        target_conversation_id: deleteMemoryAction === "move" ? deleteTargetId : undefined,
-      }),
-    });
+    setError("");
+    try {
+      await request(`/api/conversations/${deleteConversationTarget.id}/delete`, {
+        method: "POST",
+        body: JSON.stringify({
+          memory_action: deleteMemoryAction,
+          target_conversation_id: deleteMemoryAction === "move" ? deleteTargetId : undefined,
+        }),
+      });
 
-    const updatedConversations = await request<Conversation[]>("/api/conversations");
-    const nextActiveId =
-      activeId === deleteConversationTarget.id || !updatedConversations.some((conversation) => conversation.id === activeId)
-        ? updatedConversations[0]?.id ?? null
-        : activeId;
+      const updatedConversations = await request<Conversation[]>("/api/conversations");
+      const nextActiveId =
+        activeId === deleteConversationTarget.id || !updatedConversations.some((conversation) => conversation.id === activeId)
+          ? updatedConversations[0]?.id ?? null
+          : activeId;
 
-    setConversations(updatedConversations);
-    setActiveId(nextActiveId);
-    if (nextActiveId === activeId && nextActiveId !== null) {
-      await loadConversation(nextActiveId);
+      setConversations(updatedConversations);
+      setActiveId(nextActiveId);
+      if (nextActiveId === activeId && nextActiveId !== null) {
+        await loadConversation(nextActiveId);
+      }
+      setDeleteConversationTarget(null);
+      setDeleteMessageCount(0);
+      setDeleteMemoryCount(0);
+      setDeleteMemoryAction("delete");
+      setDeleteTargetId("");
+      setNotice("Conversation deleted.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete conversation");
     }
-    setDeleteConversationTarget(null);
-    setDeleteMemoryCount(0);
-    setDeleteMemoryAction("delete");
-    setDeleteTargetId("");
-    setNotice("Conversation deleted.");
   }
 
   function stopMediaRecorder(): Promise<Blob | null> {
@@ -1365,7 +1486,11 @@ export default function App() {
         include_history: boolean | number;
       } = {
         content,
-        include_history: historyLimitToIncludeHistory(composerHistoryLimit, historyMessageMax),
+        include_history: historyLimitToIncludeHistory(
+          composerHistoryContextTotal,
+          historyContextOverhead,
+          historyDbMessageCount,
+        ),
       };
       if (image) {
         payload.image_data = image.base64;
@@ -1829,19 +1954,15 @@ export default function App() {
           <span>Sovereign Gen AI</span>
         </div>
         <nav className="top-nav-menu" aria-label="Main navigation">
-          <button className={page === "chat" ? "nav-active" : ""} onClick={() => setPage("chat")}>
-            <MessageCircle size={18} />
-            Chat
-          </button>
           <button
             type="button"
-            className={isOnLatestDiscussion ? "nav-active" : ""}
-            title={latestConversation ? `Open ${latestConversation.title}` : "No conversations yet"}
+            className={page === "chat" ? "nav-active" : ""}
+            title={latestConversation ? `Open latest: ${latestConversation.title}` : "No conversations yet"}
             disabled={!latestConversation}
             onClick={() => void goToLatestDiscussion()}
           >
-            <History size={18} />
-            Latest
+            <MessageCircle size={18} />
+            Latest Chat
           </button>
           <button className={page === "memories" ? "nav-active" : ""} onClick={() => setPage("memories")}>
             <Brain size={18} />
@@ -1862,7 +1983,19 @@ export default function App() {
             <header className="page-header">
               <div>
                 <p className="eyebrow">Conversation</p>
-                <h1>{detail?.conversation.title ?? "Start a conversation"}</h1>
+                <div className="conversation-title-row">
+                  <h1>{detail?.conversation.title ?? "Start a conversation"}</h1>
+                  {detail && activeId && (
+                    <button
+                      type="button"
+                      className="conversation-header-delete"
+                      title="Delete conversation"
+                      onClick={() => void openDeleteConversationModal(detail.conversation)}
+                    >
+                      <Trash2 size={18} />
+                    </button>
+                  )}
+                </div>
               </div>
             </header>
 
@@ -2111,44 +2244,48 @@ export default function App() {
                   className="composer-history-step"
                   title="Include one fewer prior message"
                   aria-label="Decrease history by one"
-                  disabled={historyControlsDisabled || composerHistoryLimit <= 0}
-                  onClick={() => updateHistoryMessageLimit(composerHistoryLimit - 1)}
+                  disabled={historyControlsDisabled || composerHistoryContextTotal <= historySliderMinValue}
+                  onClick={() => updateHistoryMessageLimit(composerHistoryContextTotal - 1)}
                 >
                   <ChevronLeft size={18} />
                 </button>
                 <input
                   type="range"
-                  min={0}
-                  max={historyMessageMax}
+                  min={historySliderMinValue}
+                  max={historySliderMaxValue}
                   step={1}
-                  value={composerHistoryLimit}
-                  title={historyLimitTitle(composerHistoryLimit, historyMessageMax)}
+                  value={composerHistoryContextTotal}
+                  title={historyLimitTitle(composerHistoryContextTotal, historySliderMinValue, historySliderMaxValue)}
                   onChange={(event) => updateHistoryMessageLimit(Number(event.target.value))}
                   onKeyDown={(event) => {
                     if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
                       event.preventDefault();
-                      updateHistoryMessageLimit(composerHistoryLimit - 1);
+                      updateHistoryMessageLimit(composerHistoryContextTotal - 1);
                     } else if (event.key === "ArrowRight" || event.key === "ArrowUp") {
                       event.preventDefault();
-                      updateHistoryMessageLimit(composerHistoryLimit + 1);
+                      updateHistoryMessageLimit(composerHistoryContextTotal + 1);
                     }
                   }}
                   disabled={historyControlsDisabled}
-                  aria-label="Chat history to include"
-                  aria-valuetext={historyLimitTitle(composerHistoryLimit, historyMessageMax)}
+                  aria-label="Messages to send in request"
+                  aria-valuetext={historyLimitTitle(
+                    composerHistoryContextTotal,
+                    historySliderMinValue,
+                    historySliderMaxValue,
+                  )}
                 />
                 <button
                   type="button"
                   className="composer-history-step"
-                  title="Include one more prior message"
-                  aria-label="Increase history by one"
-                  disabled={historyControlsDisabled || composerHistoryLimit >= historyMessageMax}
-                  onClick={() => updateHistoryMessageLimit(composerHistoryLimit + 1)}
+                  title="Include one more message in request"
+                  aria-label="Increase message count by one"
+                  disabled={historyControlsDisabled || composerHistoryContextTotal >= historySliderMaxValue}
+                  onClick={() => updateHistoryMessageLimit(composerHistoryContextTotal + 1)}
                 >
                   <ChevronRight size={18} />
                 </button>
                 <span className="composer-history-value" aria-hidden="true">
-                  {composerHistoryLimit}
+                  {composerHistoryContextTotal}
                 </span>
               </div>
             </form>
@@ -2454,13 +2591,18 @@ export default function App() {
                         rows={2}
                       />
                     </label>
-                    <label>
-                      Optional API key
-                      <input
-                        type="password"
+                    <label className="model-row-api-key">
+                      API key
+                      <MaskedApiKeyInput
                         value={model.api_key ?? ""}
-                        onChange={(event) => updateModelDraft(index, { api_key: event.target.value })}
-                        placeholder={model.has_api_key ? "Key is set. Leave blank to keep it." : providerDefaults(model.provider).keyPlaceholder}
+                        preview={model.api_key_preview}
+                        hasApiKey={model.has_api_key}
+                        placeholder={
+                          model.has_api_key
+                            ? "Leave blank to keep current key"
+                            : providerDefaults(model.provider).keyPlaceholder
+                        }
+                        onChange={(api_key) => updateModelDraft(index, { api_key })}
                       />
                     </label>
                     <label className="checkbox-label">
@@ -2654,14 +2796,6 @@ export default function App() {
                   <span>{formatDate(conversation.updated_at)}</span>
                 </button>
               )}
-              <button
-                type="button"
-                className="conversation-delete"
-                title="Delete conversation"
-                onClick={() => void openDeleteConversationModal(conversation)}
-              >
-                <Trash2 size={15} />
-              </button>
             </div>
           ))}
           {!conversations.length && <p className="hint">Create your first conversation.</p>}
@@ -2702,7 +2836,13 @@ export default function App() {
               <h2>{deleteConversationTarget.title}</h2>
             </div>
             <p className="modal-copy">
-              Messages in this conversation will be deleted. This conversation has {deleteMemoryCount} saved {deleteMemoryCount === 1 ? "memory" : "memories"}.
+              {deleteMessageCount} {deleteMessageCount === 1 ? "message" : "messages"} in this conversation will be deleted.
+              {deleteMemoryCount > 0 && (
+                <>
+                  {" "}
+                  This conversation also has {deleteMemoryCount} saved {deleteMemoryCount === 1 ? "memory" : "memories"}.
+                </>
+              )}
             </p>
 
             {deleteMemoryCount > 0 && (
@@ -2817,13 +2957,12 @@ export default function App() {
                   rows={3}
                 />
               </label>
-              <label>
-                Optional API key
-                <input
-                  type="password"
+              <label className="model-row-api-key">
+                API key
+                <MaskedApiKeyInput
                   value={addModelDraft.api_key ?? ""}
-                  onChange={(event) => setAddModelDraft((current) => ({ ...current, api_key: event.target.value }))}
                   placeholder={providerDefaults(addModelDraft.provider).keyPlaceholder}
+                  onChange={(api_key) => setAddModelDraft((current) => ({ ...current, api_key }))}
                 />
               </label>
               <label className="checkbox-label">

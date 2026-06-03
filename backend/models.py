@@ -43,7 +43,7 @@ class Message(BaseModel):
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     generation_ms: Optional[int] = None
-    include_history: Optional[bool] = None
+    include_history: Optional[Union[bool, int]] = None
     created_at: str
 
 
@@ -144,6 +144,7 @@ class LlmModelRead(BaseModel):
     model: str
     comments: Optional[str] = None
     has_api_key: bool
+    api_key_preview: Optional[str] = None
     is_active: bool
     updated_at: str
 

@@ -352,6 +352,14 @@ def _conversation_llm_model(connection, conversation: dict) -> dict:
     return _active_llm_model(connection)
 
 
+def _mask_api_key(api_key: str | None) -> str | None:
+    if not api_key:
+        return None
+    if len(api_key) <= 6:
+        return "*" * len(api_key)
+    return f"{api_key[:3]}{'*' * (len(api_key) - 6)}{api_key[-3:]}"
+
+
 def _public_model(config: dict) -> dict:
     comments = (config.get("comments") or "").strip() or None
     return {
@@ -361,6 +369,7 @@ def _public_model(config: dict) -> dict:
         "model": config["model"],
         "comments": comments,
         "has_api_key": bool(config["api_key"]),
+        "api_key_preview": _mask_api_key(config.get("api_key")),
         "is_active": bool(config["is_active"]),
         "updated_at": config["updated_at"],
     }

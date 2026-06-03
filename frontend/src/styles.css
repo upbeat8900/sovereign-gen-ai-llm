@@ -129,6 +129,29 @@ button {
   margin: 0;
 }
 
+.conversation-title-row {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.conversation-header-delete {
+  align-items: center;
+  background: #fee2e2;
+  border: 1px solid #fecaca;
+  border-radius: 12px;
+  color: #991b1b;
+  display: inline-flex;
+  flex-shrink: 0;
+  justify-content: center;
+  padding: 8px;
+}
+
+.conversation-header-delete:hover {
+  background: #fecaca;
+  color: #7f1d1d;
+}
+
 .eyebrow {
   color: #64748b;
   font-size: 12px;
@@ -766,9 +789,7 @@ button:disabled {
   border: 1px solid transparent;
   border-radius: 16px;
   cursor: grab;
-  display: grid;
-  gap: 8px;
-  grid-template-columns: minmax(0, 1fr) auto;
+  display: block;
   padding: 8px;
 }
 
@@ -776,18 +797,15 @@ button:disabled {
   cursor: grabbing;
 }
 
-.conversation-select,
-.conversation-delete {
+.conversation-select {
   background: transparent;
   border: 0;
-  color: #f8fafc;
-}
-
-.conversation-select {
   border-radius: 10px;
+  color: #f8fafc;
   padding: 6px;
   text-align: left;
   min-width: 0;
+  width: 100%;
 }
 
 .conversation-title-edit {
@@ -819,21 +837,6 @@ button:disabled {
   display: block;
   font-size: 12px;
   margin-top: 6px;
-}
-
-.conversation-delete {
-  align-items: center;
-  align-self: start;
-  border-radius: 10px;
-  color: #fecaca;
-  display: inline-flex;
-  justify-content: center;
-  padding: 8px;
-}
-
-.conversation-delete:hover {
-  background: #7f1d1d;
-  color: #ffffff;
 }
 
 .conversation-list .conversation-active {
@@ -1344,6 +1347,21 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.model-row-api-key {
+  align-items: center;
+  display: flex !important;
+  flex-direction: row;
+  gap: 12px;
+  grid-column: 1 / span 5;
+  white-space: nowrap;
+}
+
+.model-row-api-key input {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  min-width: 320px;
+}
+
 .model-row-comments textarea {
   font: inherit;
   line-height: 1.45;
@@ -1434,6 +1452,19 @@ button:disabled {
 
 .add-model-form .active-model-check input {
   width: auto;
+}
+
+.add-model-form .model-row-api-key {
+  align-items: center;
+  display: flex !important;
+  flex-direction: row;
+  gap: 12px;
+}
+
+.add-model-form .model-row-api-key input {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  min-width: 0;
 }
 
 .modal-card h2 {
