@@ -79,6 +79,7 @@ class MessageCreate(BaseModel):
     image_data: Optional[str] = None
     image_media_type: Optional[str] = None
     include_history: Union[bool, int] = True
+    include_memories: bool = True
 
     @model_validator(mode="after")
     def validate_content_or_image(self):
@@ -110,6 +111,7 @@ class LlmContextPreview(BaseModel):
     provider: str
     model: str
     include_history: Union[bool, int]
+    include_memories: bool
     memory_count: int
     items: List[LlmContextItem]
     total_chars: int
@@ -117,6 +119,9 @@ class LlmContextPreview(BaseModel):
     image_count: int
     history_message_count: int
     images_resent_from_history: bool
+    generation_estimate_sec: Optional[float] = None
+    seconds_per_char: Optional[float] = None
+    generation_sample_count: int = 0
 
 
 class RememberCreate(BaseModel):
@@ -147,6 +152,10 @@ class LlmModelRead(BaseModel):
     api_key_preview: Optional[str] = None
     is_active: bool
     updated_at: str
+    generation_sample_count: int = 0
+    seconds_per_char: Optional[float] = None
+    avg_generation_sec: Optional[float] = None
+    reference_generation_estimate_sec: Optional[float] = None
 
 
 class LlmModelUpdate(BaseModel):

@@ -3,7 +3,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +30,7 @@ from .models import (
     LlmContextPreview,
     LlmConfigRead,
     LlmConfigUpdate,
+    LlmModelRead,
     Memory,
     MemoryGroup,
     MemoryIntegrate,
@@ -360,7 +361,7 @@ def _mask_api_key(api_key: str | None) -> str | None:
     return f"{api_key[:3]}{'*' * (len(api_key) - 6)}{api_key[-3:]}"
 
 
-def _public_model(config: dict) -> dict:
+def _public_model(connection, config: dict) -> dict:
     comments = (config.get("comments") or "").strip() or None
     return {
         "id": config["id"],
@@ -372,12 +373,13 @@ def _public_model(config: dict) -> dict:
         "api_key_preview": _mask_api_key(config.get("api_key")),
         "is_active": bool(config["is_active"]),
         "updated_at": config["updated_at"],
+        **_model_generation_timing(connection, config["provider"], config["model"]),
     }
 
 
 def _public_config(connection) -> dict:
     rows = connection.execute("SELECT * FROM llm_models ORDER BY is_active DESC, id ASC").fetchall()
-    models = [_public_model(dict(row)) for row in rows]
+    models = [_public_model(connection, dict(row)) for row in rows]
     active_model = next((model for model in models if model["is_active"]), models[0] if models else None)
     if not active_model:
         raise HTTPException(status_code=500, detail="LLM config is missing")
@@ -460,43 +462,69 @@ def _stored_include_history(include_history: Union[bool, int]) -> int:
     return -1
 
 
+def _memories_excluding_history_duplicates(memories: List[dict], history_rows: List[dict]) -> List[dict]:
+    history_ids = {row["id"] for row in history_rows if row.get("id") is not None}
+    history_contents = {
+        (row.get("content") or "").strip()
+        for row in history_rows
+        if (row.get("content") or "").strip()
+    }
+    included = []
+    for memory in memories:
+        source_id = memory.get("source_message_id")
+        if source_id is not None and source_id in history_ids:
+            continue
+        content = (memory.get("content") or "").strip()
+        if content and content in history_contents:
+            continue
+        included.append(memory)
+    return included
+
+
 def _build_llm_messages(
     connection,
     conversation_id: int,
     provider: str,
     *,
     include_history: Union[bool, int] = True,
+    include_memories: bool = True,
     pending_user: dict = None,
 ) -> List[dict]:
-    memories = _active_memories(connection, conversation_id, sort="created_at", order="asc")
+    memories = (
+        _active_memories(connection, conversation_id, sort="created_at", order="asc")
+        if include_memories
+        else []
+    )
     history_limit = _history_limit_from_include_history(include_history)
     if history_limit > 0:
         history = connection.execute(
             """
-            SELECT role, content, image_data, image_media_type FROM messages
+            SELECT id, role, content, image_data, image_media_type FROM messages
             WHERE conversation_id = ?
             ORDER BY id DESC
             LIMIT ?
             """,
             (conversation_id, history_limit),
         ).fetchall()
-        history_rows = list(reversed(history))
+        history_rows = [dict(row) for row in reversed(history)]
     else:
         history_rows = []
         if not pending_user:
             history = connection.execute(
                 """
-                SELECT role, content, image_data, image_media_type FROM messages
+                SELECT id, role, content, image_data, image_media_type FROM messages
                 WHERE conversation_id = ? AND role = 'user'
                 ORDER BY id DESC
                 LIMIT 1
                 """,
                 (conversation_id,),
             ).fetchall()
-            history_rows = list(reversed(history))
+            history_rows = [dict(row) for row in reversed(history)]
 
     if pending_user:
         history_rows.append(pending_user)
+
+    included_memories = _memories_excluding_history_duplicates(memories, history_rows)
 
     prompt_config = _prompt_config_or_default(connection)
     messages = [
@@ -505,13 +533,13 @@ def _build_llm_messages(
             "content": prompt_config["default_prompt"],
         }
     ]
-    if memories:
-        memory_text = "\n".join(f"- {memory['content']}" for memory in memories)
+    if included_memories:
+        memory_text = "\n".join(f"- {memory['content']}" for memory in included_memories)
         messages.append({"role": "system", "content": f"Conversation memory bank:\n{memory_text}"})
 
     for row in history_rows:
-        messages.append(_format_message_for_llm(dict(row), provider))
-    return messages
+        messages.append(_format_message_for_llm(row, provider))
+    return messages, len(included_memories)
 
 
 def _extract_llm_message_text(message: dict) -> str:
@@ -565,6 +593,7 @@ def _summarize_llm_context(
     provider: str,
     model: str,
     include_history: Union[bool, int],
+    include_memories: bool,
     memory_count: int,
 ) -> dict:
     items = []
@@ -614,6 +643,7 @@ def _summarize_llm_context(
         "provider": provider,
         "model": model,
         "include_history": include_history,
+        "include_memories": include_memories,
         "memory_count": memory_count,
         "items": items,
         "total_chars": total_chars,
@@ -622,6 +652,114 @@ def _summarize_llm_context(
         "history_message_count": history_message_count,
         "images_resent_from_history": images_resent_from_history and _include_history_enabled(include_history),
     }
+
+
+def _get_generation_stats(connection, provider: str, model: str) -> Optional[dict]:
+    return row_to_dict(
+        connection.execute(
+            """
+            SELECT sample_count, total_generation_ms, total_context_chars, total_output_chars
+            FROM llm_generation_stats
+            WHERE provider = ? AND model = ?
+            """,
+            (provider, model),
+        ).fetchone()
+    )
+
+
+def _seconds_per_char(stats: Optional[dict]) -> Optional[float]:
+    if not stats or stats["sample_count"] <= 0:
+        return None
+    total_chars = int(stats["total_context_chars"]) + int(stats["total_output_chars"])
+    if total_chars <= 0:
+        return None
+    return (int(stats["total_generation_ms"]) / 1000.0) / total_chars
+
+
+def _estimate_generation_seconds(stats: Optional[dict], context_chars: int) -> Optional[float]:
+    rate = _seconds_per_char(stats)
+    if rate is None:
+        return None
+    avg_output_chars = max(1, int(stats["total_output_chars"]) // int(stats["sample_count"]))
+    char_estimate = max(1, int(context_chars)) + avg_output_chars
+    return max(1.0, rate * char_estimate)
+
+
+def _generation_timing_metadata(connection, provider: str, model: str, context_chars: int) -> dict:
+    stats = _get_generation_stats(connection, provider, model)
+    rate = _seconds_per_char(stats)
+    return {
+        "generation_estimate_sec": _estimate_generation_seconds(stats, context_chars),
+        "seconds_per_char": rate,
+        "generation_sample_count": int(stats["sample_count"]) if stats else 0,
+    }
+
+
+def _model_generation_timing(connection, provider: str, model: str) -> dict:
+    stats = _get_generation_stats(connection, provider, model)
+    rate = _seconds_per_char(stats)
+    if not stats or stats["sample_count"] <= 0:
+        return {
+            "generation_sample_count": 0,
+            "seconds_per_char": None,
+            "avg_generation_sec": None,
+            "reference_generation_estimate_sec": None,
+        }
+    sample_count = int(stats["sample_count"])
+    avg_generation_sec = round(int(stats["total_generation_ms"]) / sample_count / 1000.0, 2)
+    avg_context_chars = int(int(stats["total_context_chars"]) / sample_count)
+    return {
+        "generation_sample_count": sample_count,
+        "seconds_per_char": rate,
+        "avg_generation_sec": avg_generation_sec,
+        "reference_generation_estimate_sec": _estimate_generation_seconds(stats, avg_context_chars),
+    }
+
+
+def _reset_generation_stats(connection, provider: str, model: str) -> None:
+    connection.execute(
+        "DELETE FROM llm_generation_stats WHERE provider = ? AND model = ?",
+        (provider, model),
+    )
+
+
+def _update_generation_stats(
+    connection,
+    provider: str,
+    model: str,
+    generation_ms: int,
+    context_chars: int,
+    output_chars: int,
+) -> None:
+    context_chars = max(1, int(context_chars))
+    output_chars = max(1, int(output_chars))
+    connection.execute(
+        """
+        INSERT INTO llm_generation_stats (
+            provider, model, sample_count, total_generation_ms, total_context_chars, total_output_chars
+        )
+        VALUES (?, ?, 1, ?, ?, ?)
+        ON CONFLICT(provider, model) DO UPDATE SET
+            sample_count = sample_count + 1,
+            total_generation_ms = total_generation_ms + excluded.total_generation_ms,
+            total_context_chars = total_context_chars + excluded.total_context_chars,
+            total_output_chars = total_output_chars + excluded.total_output_chars,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (provider, model, generation_ms, context_chars, output_chars),
+    )
+
+
+def _attach_generation_estimate(connection, summary: dict) -> dict:
+    summary.update(
+        _generation_timing_metadata(
+            connection,
+            summary["provider"],
+            summary["model"],
+            summary["total_chars"],
+        )
+    )
+    return summary
 
 
 @app.get("/api/health")
@@ -878,20 +1016,24 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
     with get_connection() as connection:
         conversation = _conversation_or_404(connection, conversation_id)
         config = _conversation_llm_model(connection, conversation)
-        memories = _active_memories(connection, conversation_id, sort="created_at", order="asc")
-        llm_messages = _build_llm_messages(
+        llm_messages, included_memory_count = _build_llm_messages(
             connection,
             conversation_id,
             config["provider"],
             include_history=payload.include_history,
+            include_memories=payload.include_memories,
             pending_user=pending_user,
         )
-        return _summarize_llm_context(
-            llm_messages,
-            provider=config["provider"],
-            model=config["model"],
-            include_history=payload.include_history,
-            memory_count=len(memories),
+        return _attach_generation_estimate(
+            connection,
+            _summarize_llm_context(
+                llm_messages,
+                provider=config["provider"],
+                model=config["model"],
+                include_history=payload.include_history,
+                include_memories=payload.include_memories,
+                memory_count=included_memory_count,
+            ),
         )
 
 
@@ -934,11 +1076,20 @@ def send_message(conversation_id: int, payload: MessageCreate) -> dict:
             connection.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
 
         config = _conversation_llm_model(connection, conversation)
-        llm_messages = _build_llm_messages(
+        llm_messages, included_memory_count = _build_llm_messages(
             connection,
             conversation_id,
             config["provider"],
             include_history=payload.include_history,
+            include_memories=payload.include_memories,
+        )
+        context_summary = _summarize_llm_context(
+            llm_messages,
+            provider=config["provider"],
+            model=config["model"],
+            include_history=payload.include_history,
+            include_memories=payload.include_memories,
+            memory_count=included_memory_count,
         )
         started_at = time.perf_counter()
         try:
@@ -952,6 +1103,14 @@ def send_message(conversation_id: int, payload: MessageCreate) -> dict:
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         generation_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+        _update_generation_stats(
+            connection,
+            config["provider"],
+            config["model"],
+            generation_ms,
+            context_summary["total_chars"],
+            len(assistant_content),
+        )
 
         assistant_message = _insert_message(
             connection,
@@ -1174,6 +1333,14 @@ def merge_memories(conversation_id: int, payload: MemoryMerge) -> dict:
 def get_llm_config() -> dict:
     with get_connection() as connection:
         return _public_config(connection)
+
+
+@app.delete("/api/config/llm/models/{model_id}/generation-stats", response_model=LlmModelRead)
+def reset_model_generation_stats(model_id: int) -> dict:
+    with get_connection() as connection:
+        model = _llm_model_or_404(connection, model_id)
+        _reset_generation_stats(connection, model["provider"], model["model"])
+        return _public_model(connection, model)
 
 
 @app.put("/api/config/llm", response_model=LlmConfigRead)

@@ -648,6 +648,36 @@ button {
   min-width: 0;
 }
 
+.composer-memory-toggle {
+  align-items: center;
+  color: #475569;
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 0.88rem;
+  font-weight: 600;
+  gap: 6px;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.composer-memory-toggle input {
+  accent-color: #2563eb;
+  cursor: pointer;
+  height: 16px;
+  margin: 0;
+  width: 16px;
+}
+
+.composer-memory-toggle:has(input:disabled) {
+  color: #94a3b8;
+  cursor: not-allowed;
+}
+
+.composer-memory-toggle:has(input:disabled) input {
+  cursor: not-allowed;
+}
+
 .composer .composer-history-step {
   align-items: center;
   background: #f8fafc !important;
@@ -1347,6 +1377,38 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.model-row-timing {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #dbe3ef;
+  border-radius: 14px;
+  display: flex;
+  gap: 12px;
+  grid-column: 1 / -1;
+  justify-content: space-between;
+  padding: 12px 14px;
+}
+
+.model-row-timing-label {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  margin: 0 0 4px;
+  text-transform: uppercase;
+}
+
+.model-row-timing-copy {
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.model-row-timing-reset {
+  flex-shrink: 0;
+}
+
 .model-row-api-key {
   align-items: center;
   display: flex !important;
@@ -1605,8 +1667,16 @@ button:disabled {
 .llm-context-stats {
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin: 0;
+}
+
+.llm-context-memories {
+  color: #475569;
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+  text-align: center;
 }
 
 .llm-context-stats > div {
@@ -1640,12 +1710,56 @@ button:disabled {
   text-align: center;
 }
 
+.llm-progress-estimate {
+  display: grid;
+  gap: 10px;
+}
+
+.llm-progress-bar {
+  background: #e2e8f0;
+  border-radius: 999px;
+  height: 10px;
+  overflow: hidden;
+  width: 100%;
+}
+
+.llm-progress-bar-fill {
+  background: linear-gradient(90deg, #7c3aed, #a78bfa);
+  border-radius: inherit;
+  height: 100%;
+  transition: width 0.35s ease;
+}
+
+.llm-progress-timing {
+  color: #475569;
+  display: grid;
+  font-size: 13px;
+  gap: 6px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  text-align: center;
+}
+
+.llm-progress-timing strong {
+  color: #0f172a;
+  display: block;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+.llm-progress-rate {
+  color: #64748b;
+  font-size: 12px;
+  margin: 0;
+  text-align: center;
+}
+
 .llm-progress-footer {
   align-items: center;
   border-top: 1px solid #e2e8f0;
   display: flex;
   gap: 12px;
-  justify-content: space-between;
+  justify-content: flex-end;
   padding-top: 4px;
 }
 
@@ -1724,6 +1838,15 @@ button:disabled {
 
   .model-row {
     grid-template-columns: 1fr;
+  }
+
+  .model-row-timing {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .model-row-timing-reset {
+    width: 100%;
   }
 
   .model-picker-item {

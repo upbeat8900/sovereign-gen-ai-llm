@@ -3,7 +3,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Dict, Iterator, Optional, Tuple
 
 
 DATA_DIR = Path(os.getenv("CHAT_DATA_DIR", Path(__file__).resolve().parent.parent / "data"))
@@ -124,6 +124,18 @@ def init_db() -> None:
                 default_prompt TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS llm_generation_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                total_generation_ms INTEGER NOT NULL DEFAULT 0,
+                total_context_chars INTEGER NOT NULL DEFAULT 0,
+                total_output_chars INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(provider, model)
+            );
             """
         )
         _ensure_column(connection, "conversations", "sort_order", "INTEGER")
@@ -164,6 +176,7 @@ def init_db() -> None:
             """,
             (DEFAULT_SYSTEM_PROMPT,),
         )
+        _backfill_generation_stats(connection)
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
@@ -240,3 +253,51 @@ def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
     if row is None:
         return None
     return dict(row)
+
+
+def _backfill_generation_stats(connection: sqlite3.Connection) -> None:
+    existing = connection.execute("SELECT COUNT(*) AS count FROM llm_generation_stats").fetchone()["count"]
+    if existing:
+        return
+
+    rows = connection.execute(
+        """
+        SELECT llm_provider, llm_model, generation_ms, LENGTH(content) AS output_chars
+        FROM messages
+        WHERE role = 'assistant'
+          AND generation_ms IS NOT NULL
+          AND llm_provider IS NOT NULL
+          AND llm_model IS NOT NULL
+        """
+    ).fetchall()
+    aggregates: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for row in rows:
+        key = (row["llm_provider"], row["llm_model"])
+        output_chars = max(1, int(row["output_chars"] or 1))
+        context_chars = output_chars * 2
+        bucket = aggregates.setdefault(
+            key,
+            {"sample_count": 0, "total_generation_ms": 0, "total_context_chars": 0, "total_output_chars": 0},
+        )
+        bucket["sample_count"] += 1
+        bucket["total_generation_ms"] += int(row["generation_ms"])
+        bucket["total_context_chars"] += context_chars
+        bucket["total_output_chars"] += output_chars
+
+    for (provider, model), bucket in aggregates.items():
+        connection.execute(
+            """
+            INSERT INTO llm_generation_stats (
+                provider, model, sample_count, total_generation_ms, total_context_chars, total_output_chars
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                provider,
+                model,
+                bucket["sample_count"],
+                bucket["total_generation_ms"],
+                bucket["total_context_chars"],
+                bucket["total_output_chars"],
+            ),
+        )

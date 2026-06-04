@@ -98,6 +98,10 @@ type LlmModel = {
   updated_at?: string;
   api_key?: string;
   clear_api_key?: boolean;
+  generation_sample_count?: number;
+  seconds_per_char?: number | null;
+  avg_generation_sec?: number | null;
+  reference_generation_estimate_sec?: number | null;
 };
 
 type LlmConfig = {
@@ -146,11 +150,12 @@ const TTS_VOICE_STORAGE_KEY = "tts_voice_uri";
 const TTS_RATE_STORAGE_KEY = "tts_speech_rate";
 const CURRENT_MESSAGE_ONLY_STORAGE_KEY = "chat_current_message_only";
 const HISTORY_MESSAGE_LIMIT_STORAGE_KEY = "chat_history_message_limit";
+const INCLUDE_MEMORIES_STORAGE_KEY = "chat_include_memories";
 const HISTORY_FULL_SENTINEL = -1;
 const LLM_HISTORY_DB_CAP = 40;
 
-function llmContextOverhead(memoryCount: number) {
-  return 1 + (memoryCount > 0 ? 1 : 0);
+function llmContextOverhead(memoryCount: number, includeMemories: boolean) {
+  return 1 + (includeMemories && memoryCount > 0 ? 1 : 0);
 }
 
 function historySliderMin(overhead: number) {
@@ -222,6 +227,14 @@ function migrateStoredHistoryContextTotal(
 function persistHistoryMessageLimit(limit: number) {
   localStorage.setItem(HISTORY_MESSAGE_LIMIT_STORAGE_KEY, String(limit));
   localStorage.removeItem(CURRENT_MESSAGE_ONLY_STORAGE_KEY);
+}
+
+function readStoredIncludeMemories(): boolean {
+  return localStorage.getItem(INCLUDE_MEMORIES_STORAGE_KEY) !== "false";
+}
+
+function persistIncludeMemories(value: boolean) {
+  localStorage.setItem(INCLUDE_MEMORIES_STORAGE_KEY, String(value));
 }
 
 function clampHistoryContextTotal(next: number, min: number, max: number) {
@@ -527,6 +540,7 @@ type LlmContextPreview = {
   provider: string;
   model: string;
   include_history: boolean | number;
+  include_memories: boolean;
   memory_count: number;
   items: LlmContextItem[];
   total_chars: number;
@@ -534,6 +548,9 @@ type LlmContextPreview = {
   image_count: number;
   history_message_count: number;
   images_resent_from_history: boolean;
+  generation_estimate_sec?: number | null;
+  seconds_per_char?: number | null;
+  generation_sample_count?: number;
 };
 
 function assistantUsedCurrentMessageOnly(message: Message) {
@@ -551,6 +568,22 @@ function formatGenerationDuration(ms: number) {
   const minutes = Math.floor(ms / 60_000);
   const seconds = Math.round((ms % 60_000) / 1000);
   return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function formatDurationSeconds(seconds: number) {
+  if (seconds < 60) {
+    return seconds < 10 ? `${seconds.toFixed(1)} s` : `${Math.round(seconds)} s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.round(seconds % 60);
+  return remainder > 0 ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function generationProgressPercent(elapsedSec: number, estimateSec: number | null | undefined) {
+  if (!estimateSec || estimateSec <= 0) {
+    return null;
+  }
+  return Math.min(95, Math.max(2, (elapsedSec / estimateSec) * 100));
 }
 
 export default function App() {
@@ -578,6 +611,7 @@ export default function App() {
   const [settingsSaveSuccessMessage, setSettingsSaveSuccessMessage] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [historyMessageLimit, setHistoryMessageLimit] = useState(readStoredHistoryMessageLimit);
+  const [includeMemories, setIncludeMemories] = useState(readStoredIncludeMemories);
   const [llmProgressModel, setLlmProgressModel] = useState("");
   const [generationElapsedSec, setGenerationElapsedSec] = useState(0);
   const [llmContextPreview, setLlmContextPreview] = useState<LlmContextPreview | null>(null);
@@ -598,6 +632,7 @@ export default function App() {
   const [configDraft, setConfigDraft] = useState<LlmModel[]>([]);
   const [isAddModelModalOpen, setIsAddModelModalOpen] = useState(false);
   const [addModelDraft, setAddModelDraft] = useState<LlmModel>(() => createAddModelDraft(true));
+  const [resettingTimingModelId, setResettingTimingModelId] = useState<number | null>(null);
   const [speechConfig, setSpeechConfig] = useState<SpeechConfig | null>(null);
   const [whisperModelDraft, setWhisperModelDraft] = useState("base.en");
   const [promptConfig, setPromptConfig] = useState<PromptConfig | null>(null);
@@ -707,7 +742,7 @@ export default function App() {
     return config?.models.find((model) => model.id === modelId) ?? config?.active_model ?? null;
   }, [config, detail?.conversation.llm_model_id]);
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
-  const historyContextOverhead = llmContextOverhead(detail?.memories.length ?? 0);
+  const historyContextOverhead = llmContextOverhead(detail?.memories.length ?? 0, includeMemories);
   const historyDbMessageCount = detail?.messages.length ?? 0;
   const historySliderMinValue = historySliderMin(historyContextOverhead);
   const historySliderMaxValue = historySliderMax(historyContextOverhead, historyDbMessageCount);
@@ -738,6 +773,11 @@ export default function App() {
     const stored = storedHistoryLimitFromContextTotal(next, historySliderMinValue, historySliderMaxValue);
     setHistoryMessageLimit(stored);
     persistHistoryMessageLimit(stored);
+  }
+
+  function updateIncludeMemories(next: boolean) {
+    setIncludeMemories(next);
+    persistIncludeMemories(next);
   }
 
   useEffect(() => {
@@ -1159,6 +1199,42 @@ export default function App() {
     );
   }
 
+  async function resetModelGenerationStats(modelId: number) {
+    setError("");
+    setResettingTimingModelId(modelId);
+    try {
+      const updatedModel = await request<LlmModel>(`/api/config/llm/models/${modelId}/generation-stats`, {
+        method: "DELETE",
+      });
+      setConfig((current) =>
+        current
+          ? {
+              ...current,
+              models: current.models.map((model) => (model.id === modelId ? { ...model, ...updatedModel } : model)),
+              active_model: current.active_model.id === modelId ? { ...current.active_model, ...updatedModel } : current.active_model,
+            }
+          : current,
+      );
+      setConfigDraft((current) =>
+        current.map((model) =>
+          model.id === modelId
+            ? {
+                ...model,
+                ...updatedModel,
+                api_key: model.api_key ?? "",
+                clear_api_key: model.clear_api_key ?? false,
+              }
+            : model,
+        ),
+      );
+      showSettingsSaveSuccess("Generation timing estimate reset.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reset generation timing");
+    } finally {
+      setResettingTimingModelId(null);
+    }
+  }
+
   async function loadSpeechConfig() {
     const data = await request<SpeechConfig>("/api/config/speech");
     setSpeechConfig(data);
@@ -1484,6 +1560,7 @@ export default function App() {
         image_data?: string;
         image_media_type?: string;
         include_history: boolean | number;
+        include_memories: boolean;
       } = {
         content,
         include_history: historyLimitToIncludeHistory(
@@ -1491,6 +1568,7 @@ export default function App() {
           historyContextOverhead,
           historyDbMessageCount,
         ),
+        include_memories: includeMemories,
       };
       if (image) {
         payload.image_data = image.base64;
@@ -2239,6 +2317,22 @@ export default function App() {
                 </div>
               </div>
               <div className="composer-history">
+                <label
+                  className="composer-memory-toggle"
+                  title={
+                    (detail?.memories.length ?? 0) > 0
+                      ? "Include saved memories in the LLM request"
+                      : "No saved memories in this conversation"
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={includeMemories}
+                    onChange={(event) => updateIncludeMemories(event.target.checked)}
+                    disabled={historyControlsDisabled || !(detail?.memories.length ?? 0)}
+                  />
+                  Memories
+                </label>
                 <button
                   type="button"
                   className="composer-history-step"
@@ -2591,6 +2685,39 @@ export default function App() {
                         rows={2}
                       />
                     </label>
+                    <div className="model-row-timing">
+                      <div>
+                        <p className="model-row-timing-label">Generation timing estimate</p>
+                        {model.generation_sample_count && model.generation_sample_count > 0 ? (
+                          <p className="model-row-timing-copy">
+                            ~{formatDurationSeconds(model.reference_generation_estimate_sec ?? 0)} typical reply ·{" "}
+                            {((model.seconds_per_char ?? 0) * 1000).toFixed(2)} ms/char · avg{" "}
+                            {formatDurationSeconds(model.avg_generation_sec ?? 0)} · {model.generation_sample_count}{" "}
+                            sample{model.generation_sample_count === 1 ? "" : "s"}
+                          </p>
+                        ) : (
+                          <p className="model-row-timing-copy">No timing data yet. Estimates appear after chat replies.</p>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary-button model-row-timing-reset"
+                        disabled={!model.id || resettingTimingModelId === model.id || !model.generation_sample_count}
+                        onClick={() => model.id && void resetModelGenerationStats(model.id)}
+                      >
+                        {resettingTimingModelId === model.id ? (
+                          <>
+                            <Loader2 size={16} className="spin" />
+                            Resetting...
+                          </>
+                        ) : (
+                          <>
+                            <RotateCcw size={16} />
+                            Reset timing
+                          </>
+                        )}
+                      </button>
+                    </div>
                     <label className="model-row-api-key">
                       API key
                       <MaskedApiKeyInput
@@ -3092,29 +3219,86 @@ export default function App() {
             </div>
 
             {llmContextPreview ? (
-              <dl className="llm-context-stats">
-                <div>
-                  <dt>Messages</dt>
-                  <dd>{llmContextPreview.items.length}</dd>
-                </div>
-                <div>
-                  <dt>Images</dt>
-                  <dd>{llmContextPreview.image_count}</dd>
-                </div>
-                <div>
-                  <dt>Characters</dt>
-                  <dd>{llmContextPreview.total_chars.toLocaleString()}</dd>
-                </div>
-              </dl>
+              <>
+                <p className="llm-context-memories">
+                  Including {llmContextPreview.memory_count}{" "}
+                  {llmContextPreview.memory_count === 1 ? "memory" : "memories"} from this conversation
+                </p>
+                <dl className="llm-context-stats">
+                  <div>
+                    <dt>Messages</dt>
+                    <dd>{llmContextPreview.items.length}</dd>
+                  </div>
+                  <div>
+                    <dt>Memories</dt>
+                    <dd>{llmContextPreview.memory_count}</dd>
+                  </div>
+                  <div>
+                    <dt>Images</dt>
+                    <dd>{llmContextPreview.image_count}</dd>
+                  </div>
+                  <div>
+                    <dt>Characters</dt>
+                    <dd>{llmContextPreview.total_chars.toLocaleString()}</dd>
+                  </div>
+                </dl>
+                {sending && llmContextPreview.generation_estimate_sec != null && (
+                  <div className="llm-progress-estimate">
+                    <div
+                      className="llm-progress-bar"
+                      role="progressbar"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={Math.round(generationProgressPercent(generationElapsedSec, llmContextPreview.generation_estimate_sec) ?? 0)}
+                      aria-label="Estimated generation progress"
+                    >
+                      <div
+                        className="llm-progress-bar-fill"
+                        style={{
+                          width: `${generationProgressPercent(generationElapsedSec, llmContextPreview.generation_estimate_sec) ?? 0}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="llm-progress-timing">
+                      <span>
+                        Elapsed: <strong>{formatDurationSeconds(generationElapsedSec)}</strong>
+                      </span>
+                      <span>
+                        Predicted:{" "}
+                        <strong>{formatDurationSeconds(llmContextPreview.generation_estimate_sec)}</strong>
+                      </span>
+                      <span>
+                        Remaining:{" "}
+                        <strong>
+                          {formatDurationSeconds(
+                            Math.max(0, llmContextPreview.generation_estimate_sec - generationElapsedSec),
+                          )}
+                        </strong>
+                      </span>
+                    </div>
+                    {llmContextPreview.generation_sample_count != null &&
+                      llmContextPreview.generation_sample_count > 0 &&
+                      llmContextPreview.seconds_per_char != null && (
+                        <p className="llm-progress-rate">
+                          Based on {llmContextPreview.generation_sample_count} previous request
+                          {llmContextPreview.generation_sample_count === 1 ? "" : "s"} (
+                          {(llmContextPreview.seconds_per_char * 1000).toFixed(2)} ms/char)
+                        </p>
+                      )}
+                  </div>
+                )}
+              </>
             ) : (
               <p className="llm-context-loading">Loading request preview...</p>
             )}
 
             {sending && (
               <div className="llm-progress-footer">
-                <span className="llm-progress-timer" aria-live="polite">
-                  {generationElapsedSec}s
-                </span>
+                {llmContextPreview?.generation_estimate_sec == null && (
+                  <span className="llm-progress-timer" aria-live="polite">
+                    Elapsed: {formatDurationSeconds(generationElapsedSec)}
+                  </span>
+                )}
                 <button type="button" className="secondary-button llm-progress-cancel" onClick={cancelGeneration}>
                   Cancel
                 </button>
