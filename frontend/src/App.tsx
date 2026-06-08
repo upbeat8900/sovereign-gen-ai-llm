@@ -151,11 +151,24 @@ const TTS_RATE_STORAGE_KEY = "tts_speech_rate";
 const CURRENT_MESSAGE_ONLY_STORAGE_KEY = "chat_current_message_only";
 const HISTORY_MESSAGE_LIMIT_STORAGE_KEY = "chat_history_message_limit";
 const INCLUDE_MEMORIES_STORAGE_KEY = "chat_include_memories";
+const INCLUDE_ALL_MEMORIES_STORAGE_KEY = "chat_include_all_memories";
 const HISTORY_FULL_SENTINEL = -1;
 const LLM_HISTORY_DB_CAP = 40;
 
-function llmContextOverhead(memoryCount: number, includeMemories: boolean) {
-  return 1 + (includeMemories && memoryCount > 0 ? 1 : 0);
+function llmContextOverhead(
+  memoryCount: number,
+  includeMemories: boolean,
+  allMemoryCount: number,
+  includeAllMemories: boolean,
+) {
+  let overhead = 1;
+  if (includeMemories && memoryCount > 0) {
+    overhead += 1;
+  }
+  if (includeAllMemories && allMemoryCount > 0) {
+    overhead += 1;
+  }
+  return overhead;
 }
 
 function historySliderMin(overhead: number) {
@@ -237,6 +250,14 @@ function persistIncludeMemories(value: boolean) {
   localStorage.setItem(INCLUDE_MEMORIES_STORAGE_KEY, String(value));
 }
 
+function readStoredIncludeAllMemories(): boolean {
+  return localStorage.getItem(INCLUDE_ALL_MEMORIES_STORAGE_KEY) === "true";
+}
+
+function persistIncludeAllMemories(value: boolean) {
+  localStorage.setItem(INCLUDE_ALL_MEMORIES_STORAGE_KEY, String(value));
+}
+
 function clampHistoryContextTotal(next: number, min: number, max: number) {
   return Math.max(min, Math.min(max, next));
 }
@@ -270,6 +291,8 @@ const TTS_RATE_MAX = 2;
 const TTS_SAMPLE_TEXT = "Hello, this is a sample of how the assistant will sound when reading replies.";
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const CONVERSATION_PANE_WIDTH = 330;
+const CONVERSATION_PANE_AUTO_COLLAPSE_MULTIPLIER = 3;
 const WHISPER_MODEL_LABELS: Record<string, string> = {
   "tiny.en": "Tiny English — fastest",
   "base.en": "Base English — balanced",
@@ -541,7 +564,9 @@ type LlmContextPreview = {
   model: string;
   include_history: boolean | number;
   include_memories: boolean;
+  include_all_memories: boolean;
   memory_count: number;
+  all_memory_count: number;
   items: LlmContextItem[];
   total_chars: number;
   approx_tokens: number;
@@ -612,6 +637,7 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [historyMessageLimit, setHistoryMessageLimit] = useState(readStoredHistoryMessageLimit);
   const [includeMemories, setIncludeMemories] = useState(readStoredIncludeMemories);
+  const [includeAllMemories, setIncludeAllMemories] = useState(readStoredIncludeAllMemories);
   const [llmProgressModel, setLlmProgressModel] = useState("");
   const [generationElapsedSec, setGenerationElapsedSec] = useState(0);
   const [llmContextPreview, setLlmContextPreview] = useState<LlmContextPreview | null>(null);
@@ -647,6 +673,7 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<number | null>(null);
+  const [conversationPaneCollapsed, setConversationPaneCollapsed] = useState(false);
   const skipConversationTitleSaveRef = useRef(false);
   const isRecordingRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -742,7 +769,12 @@ export default function App() {
     return config?.models.find((model) => model.id === modelId) ?? config?.active_model ?? null;
   }, [config, detail?.conversation.llm_model_id]);
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
-  const historyContextOverhead = llmContextOverhead(detail?.memories.length ?? 0, includeMemories);
+  const historyContextOverhead = llmContextOverhead(
+    detail?.memories.length ?? 0,
+    includeMemories,
+    allMemories.length,
+    includeAllMemories,
+  );
   const historyDbMessageCount = detail?.messages.length ?? 0;
   const historySliderMinValue = historySliderMin(historyContextOverhead);
   const historySliderMaxValue = historySliderMax(historyContextOverhead, historyDbMessageCount);
@@ -780,11 +812,35 @@ export default function App() {
     persistIncludeMemories(next);
   }
 
+  function updateIncludeAllMemories(next: boolean) {
+    setIncludeAllMemories(next);
+    persistIncludeAllMemories(next);
+  }
+
   useEffect(() => {
     loadConversations();
+    loadMemoryGroups();
     loadConfig();
     setTtsSpeechRate(readStoredTtsSpeechRate());
   }, []);
+
+  useEffect(() => {
+    const collapseThreshold = CONVERSATION_PANE_WIDTH * CONVERSATION_PANE_AUTO_COLLAPSE_MULTIPLIER;
+
+    function syncConversationPaneCollapse() {
+      if (window.innerWidth < collapseThreshold) {
+        setConversationPaneCollapsed(true);
+      }
+    }
+
+    syncConversationPaneCollapse();
+    window.addEventListener("resize", syncConversationPaneCollapse);
+    return () => window.removeEventListener("resize", syncConversationPaneCollapse);
+  }, []);
+
+  function toggleConversationPane() {
+    setConversationPaneCollapsed((current) => !current);
+  }
 
   useEffect(() => {
     function handleSpeechRateStorage(event: StorageEvent) {
@@ -1561,6 +1617,7 @@ export default function App() {
         image_media_type?: string;
         include_history: boolean | number;
         include_memories: boolean;
+        include_all_memories: boolean;
       } = {
         content,
         include_history: historyLimitToIncludeHistory(
@@ -1569,6 +1626,7 @@ export default function App() {
           historyDbMessageCount,
         ),
         include_memories: includeMemories,
+        include_all_memories: includeAllMemories,
       };
       if (image) {
         payload.image_data = image.base64;
@@ -2025,7 +2083,7 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${conversationPaneCollapsed ? "conversation-pane-collapsed" : ""}`}>
       <header className="top-nav">
         <div className="brand">
           <Sparkles size={22} />
@@ -2051,6 +2109,20 @@ export default function App() {
             Config
           </button>
         </nav>
+        <div className="top-nav-actions">
+          <button
+            type="button"
+            className="top-nav-new"
+            aria-label="New conversation"
+            title="New conversation"
+            onClick={() => {
+              setNewTitle("");
+              setIsNewConversationModalOpen(true);
+            }}
+          >
+            <Plus size={18} strokeWidth={2.75} />
+          </button>
+        </div>
       </header>
 
       <main className="workspace">
@@ -2381,6 +2453,22 @@ export default function App() {
                 <span className="composer-history-value" aria-hidden="true">
                   {composerHistoryContextTotal}
                 </span>
+                <label
+                  className="composer-memory-toggle"
+                  title={
+                    allMemories.length > 0
+                      ? "Include memories from all conversations as user memories in the LLM request"
+                      : "No saved memories yet"
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={includeAllMemories}
+                    onChange={(event) => updateIncludeAllMemories(event.target.checked)}
+                    disabled={historyControlsDisabled || allMemories.length === 0}
+                  />
+                  Add all memories
+                </label>
               </div>
             </form>
           </section>
@@ -2844,17 +2932,20 @@ export default function App() {
         )}
       </main>
 
-      <aside className="conversation-pane">
-        <div className="new-conversation">
-          <button onClick={() => {
-            setNewTitle("");
-            setIsNewConversationModalOpen(true);
-          }}>
-            <Plus size={16} />
-            New
+      <aside className={`conversation-pane ${conversationPaneCollapsed ? "conversation-pane-is-collapsed" : ""}`}>
+        <div className="conversation-pane-toolbar">
+          <button
+            type="button"
+            className="conversation-pane-toggle"
+            aria-label={conversationPaneCollapsed ? "Expand discussions" : "Collapse discussions"}
+            title={conversationPaneCollapsed ? "Expand discussions" : "Collapse discussions"}
+            onClick={toggleConversationPane}
+          >
+            {conversationPaneCollapsed ? <ChevronLeft size={18} /> : <ChevronRight size={18} />}
           </button>
         </div>
 
+        {!conversationPaneCollapsed && (
         <div className="conversation-list">
           {conversations.map((conversation) => (
             <div
@@ -2927,6 +3018,7 @@ export default function App() {
           ))}
           {!conversations.length && <p className="hint">Create your first conversation.</p>}
         </div>
+        )}
       </aside>
 
       {isNewConversationModalOpen && (
@@ -3221,8 +3313,26 @@ export default function App() {
             {llmContextPreview ? (
               <>
                 <p className="llm-context-memories">
-                  Including {llmContextPreview.memory_count}{" "}
-                  {llmContextPreview.memory_count === 1 ? "memory" : "memories"} from this conversation
+                  {llmContextPreview.include_memories && llmContextPreview.memory_count > 0 && (
+                    <>
+                      Including {llmContextPreview.memory_count}{" "}
+                      {llmContextPreview.memory_count === 1 ? "memory" : "memories"} from this conversation
+                    </>
+                  )}
+                  {llmContextPreview.include_memories &&
+                    llmContextPreview.memory_count > 0 &&
+                    llmContextPreview.include_all_memories &&
+                    llmContextPreview.all_memory_count > 0 &&
+                    " · "}
+                  {llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0 && (
+                    <>
+                      Including {llmContextPreview.all_memory_count} user{" "}
+                      {llmContextPreview.all_memory_count === 1 ? "memory" : "memories"} from all conversations
+                    </>
+                  )}
+                  {!llmContextPreview.include_memories &&
+                    !(llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0) &&
+                    "No memories included"}
                 </p>
                 <dl className="llm-context-stats">
                   <div>
@@ -3231,7 +3341,12 @@ export default function App() {
                   </div>
                   <div>
                     <dt>Memories</dt>
-                    <dd>{llmContextPreview.memory_count}</dd>
+                    <dd>
+                      {llmContextPreview.memory_count}
+                      {llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0
+                        ? ` + ${llmContextPreview.all_memory_count} all`
+                        : ""}
+                    </dd>
                   </div>
                   <div>
                     <dt>Images</dt>
