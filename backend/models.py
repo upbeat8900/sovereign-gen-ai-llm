@@ -80,6 +80,7 @@ class MessageCreate(BaseModel):
     image_media_type: Optional[str] = None
     include_history: Union[bool, int] = True
     include_memories: bool = True
+    include_all_memories: bool = False
 
     @model_validator(mode="after")
     def validate_content_or_image(self):
@@ -112,7 +113,9 @@ class LlmContextPreview(BaseModel):
     model: str
     include_history: Union[bool, int]
     include_memories: bool
+    include_all_memories: bool
     memory_count: int
+    all_memory_count: int
     items: List[LlmContextItem]
     total_chars: int
     approx_tokens: int

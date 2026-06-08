@@ -78,6 +78,22 @@ def _conversation_or_404(connection, conversation_id: int) -> dict:
     return conversation
 
 
+def _all_active_memories(connection, sort: str = "created_at", order: str = "asc") -> List[dict]:
+    if sort not in {"created_at", "content", "title", "llm_model"}:
+        raise HTTPException(status_code=400, detail="Unsupported memory sort field")
+    if order not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail="Unsupported memory sort order")
+
+    rows = connection.execute(
+        f"""
+        SELECT * FROM memories
+        WHERE archived_at IS NULL
+        ORDER BY {sort} {order.upper()}
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _active_memories(connection, conversation_id: int, sort: str = "created_at", order: str = "desc") -> List[dict]:
     if sort not in {"created_at", "content", "title", "llm_model"}:
         raise HTTPException(status_code=400, detail="Unsupported memory sort field")
@@ -488,11 +504,17 @@ def _build_llm_messages(
     *,
     include_history: Union[bool, int] = True,
     include_memories: bool = True,
+    include_all_memories: bool = False,
     pending_user: dict = None,
-) -> List[dict]:
+) -> tuple[List[dict], int, int]:
     memories = (
         _active_memories(connection, conversation_id, sort="created_at", order="asc")
         if include_memories
+        else []
+    )
+    all_memories = (
+        _all_active_memories(connection, sort="created_at", order="asc")
+        if include_all_memories
         else []
     )
     history_limit = _history_limit_from_include_history(include_history)
@@ -525,6 +547,7 @@ def _build_llm_messages(
         history_rows.append(pending_user)
 
     included_memories = _memories_excluding_history_duplicates(memories, history_rows)
+    included_all_memories = _memories_excluding_history_duplicates(all_memories, history_rows)
 
     prompt_config = _prompt_config_or_default(connection)
     messages = [
@@ -536,10 +559,13 @@ def _build_llm_messages(
     if included_memories:
         memory_text = "\n".join(f"- {memory['content']}" for memory in included_memories)
         messages.append({"role": "system", "content": f"Conversation memory bank:\n{memory_text}"})
+    if included_all_memories:
+        all_memory_text = "\n".join(f"- {memory['content']}" for memory in included_all_memories)
+        messages.append({"role": "user", "content": f"User memories:\n{all_memory_text}"})
 
     for row in history_rows:
         messages.append(_format_message_for_llm(row, provider))
-    return messages, len(included_memories)
+    return messages, len(included_memories), len(included_all_memories)
 
 
 def _extract_llm_message_text(message: dict) -> str:
@@ -581,6 +607,8 @@ def _label_llm_message(message: dict) -> str:
             return "Memory bank"
         return "System prompt"
     if role == "user":
+        if content.startswith("User memories:"):
+            return "User memories"
         return "User message"
     if role == "assistant":
         return "Assistant reply"
@@ -594,7 +622,9 @@ def _summarize_llm_context(
     model: str,
     include_history: Union[bool, int],
     include_memories: bool,
+    include_all_memories: bool,
     memory_count: int,
+    all_memory_count: int,
 ) -> dict:
     items = []
     total_chars = 0
@@ -644,7 +674,9 @@ def _summarize_llm_context(
         "model": model,
         "include_history": include_history,
         "include_memories": include_memories,
+        "include_all_memories": include_all_memories,
         "memory_count": memory_count,
+        "all_memory_count": all_memory_count,
         "items": items,
         "total_chars": total_chars,
         "approx_tokens": max(1, total_chars // 4),
@@ -1016,12 +1048,13 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
     with get_connection() as connection:
         conversation = _conversation_or_404(connection, conversation_id)
         config = _conversation_llm_model(connection, conversation)
-        llm_messages, included_memory_count = _build_llm_messages(
+        llm_messages, included_memory_count, included_all_memory_count = _build_llm_messages(
             connection,
             conversation_id,
             config["provider"],
             include_history=payload.include_history,
             include_memories=payload.include_memories,
+            include_all_memories=payload.include_all_memories,
             pending_user=pending_user,
         )
         return _attach_generation_estimate(
@@ -1032,7 +1065,9 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
                 model=config["model"],
                 include_history=payload.include_history,
                 include_memories=payload.include_memories,
+                include_all_memories=payload.include_all_memories,
                 memory_count=included_memory_count,
+                all_memory_count=included_all_memory_count,
             ),
         )
 
@@ -1076,12 +1111,13 @@ def send_message(conversation_id: int, payload: MessageCreate) -> dict:
             connection.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
 
         config = _conversation_llm_model(connection, conversation)
-        llm_messages, included_memory_count = _build_llm_messages(
+        llm_messages, included_memory_count, included_all_memory_count = _build_llm_messages(
             connection,
             conversation_id,
             config["provider"],
             include_history=payload.include_history,
             include_memories=payload.include_memories,
+            include_all_memories=payload.include_all_memories,
         )
         context_summary = _summarize_llm_context(
             llm_messages,
@@ -1089,7 +1125,9 @@ def send_message(conversation_id: int, payload: MessageCreate) -> dict:
             model=config["model"],
             include_history=payload.include_history,
             include_memories=payload.include_memories,
+            include_all_memories=payload.include_all_memories,
             memory_count=included_memory_count,
+            all_memory_count=included_all_memory_count,
         )
         started_at = time.perf_counter()
         try:
