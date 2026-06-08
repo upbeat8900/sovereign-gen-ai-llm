@@ -78,19 +78,35 @@ def _conversation_or_404(connection, conversation_id: int) -> dict:
     return conversation
 
 
-def _all_active_memories(connection, sort: str = "created_at", order: str = "asc") -> List[dict]:
+def _all_active_memories(
+    connection,
+    sort: str = "created_at",
+    order: str = "asc",
+    *,
+    exclude_conversation_id: int = None,
+) -> List[dict]:
     if sort not in {"created_at", "content", "title", "llm_model"}:
         raise HTTPException(status_code=400, detail="Unsupported memory sort field")
     if order not in {"asc", "desc"}:
         raise HTTPException(status_code=400, detail="Unsupported memory sort order")
 
-    rows = connection.execute(
-        f"""
-        SELECT * FROM memories
-        WHERE archived_at IS NULL
-        ORDER BY {sort} {order.upper()}
-        """
-    ).fetchall()
+    if exclude_conversation_id is None:
+        rows = connection.execute(
+            f"""
+            SELECT * FROM memories
+            WHERE archived_at IS NULL
+            ORDER BY {sort} {order.upper()}
+            """
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            f"""
+            SELECT * FROM memories
+            WHERE archived_at IS NULL AND conversation_id != ?
+            ORDER BY {sort} {order.upper()}
+            """,
+            (exclude_conversation_id,),
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -513,7 +529,12 @@ def _build_llm_messages(
         else []
     )
     all_memories = (
-        _all_active_memories(connection, sort="created_at", order="asc")
+        _all_active_memories(
+            connection,
+            sort="created_at",
+            order="asc",
+            exclude_conversation_id=conversation_id,
+        )
         if include_all_memories
         else []
     )

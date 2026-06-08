@@ -745,16 +745,6 @@ button {
   text-align: right;
 }
 
-.composer-history:has(input:disabled) {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.composer-history:has(input:disabled) input[type="range"],
-.composer-history:has(input:disabled) .composer-history-step {
-  cursor: not-allowed;
-}
-
 @keyframes mic-pulse {
   0%,
   100% {

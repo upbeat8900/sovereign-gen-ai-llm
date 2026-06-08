@@ -689,6 +689,10 @@ export default function App() {
   const pendingLatestScrollRef = useRef(false);
 
   const allMemories = useMemo(() => memoryGroups.flatMap((group) => group.memories), [memoryGroups]);
+  const otherConversationMemories = useMemo(
+    () => allMemories.filter((memory) => memory.conversation_id !== activeId),
+    [allMemories, activeId],
+  );
   const selectedMemories = useMemo(
     () => allMemories.filter((memory) => selectedMemoryIds.includes(memory.id)),
     [allMemories, selectedMemoryIds],
@@ -772,7 +776,7 @@ export default function App() {
   const historyContextOverhead = llmContextOverhead(
     detail?.memories.length ?? 0,
     includeMemories,
-    allMemories.length,
+    otherConversationMemories.length,
     includeAllMemories,
   );
   const historyDbMessageCount = detail?.messages.length ?? 0;
@@ -2393,7 +2397,7 @@ export default function App() {
                   className="composer-memory-toggle"
                   title={
                     (detail?.memories.length ?? 0) > 0
-                      ? "Include saved memories in the LLM request"
+                      ? "Include this conversation's saved memories in the LLM request"
                       : "No saved memories in this conversation"
                   }
                 >
@@ -2401,7 +2405,7 @@ export default function App() {
                     type="checkbox"
                     checked={includeMemories}
                     onChange={(event) => updateIncludeMemories(event.target.checked)}
-                    disabled={historyControlsDisabled || !(detail?.memories.length ?? 0)}
+                    disabled={historyControlsDisabled}
                   />
                   Memories
                 </label>
@@ -2456,18 +2460,18 @@ export default function App() {
                 <label
                   className="composer-memory-toggle"
                   title={
-                    allMemories.length > 0
-                      ? "Include memories from all conversations as user memories in the LLM request"
-                      : "No saved memories yet"
+                    otherConversationMemories.length > 0
+                      ? "Include memories from all other conversations as user memories in the LLM request"
+                      : "No saved memories in other conversations"
                   }
                 >
                   <input
                     type="checkbox"
                     checked={includeAllMemories}
                     onChange={(event) => updateIncludeAllMemories(event.target.checked)}
-                    disabled={historyControlsDisabled || allMemories.length === 0}
+                    disabled={historyControlsDisabled}
                   />
-                  Add all memories
+                  Other conversations
                 </label>
               </div>
             </form>
@@ -3327,7 +3331,7 @@ export default function App() {
                   {llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0 && (
                     <>
                       Including {llmContextPreview.all_memory_count} user{" "}
-                      {llmContextPreview.all_memory_count === 1 ? "memory" : "memories"} from all conversations
+                      {llmContextPreview.all_memory_count === 1 ? "memory" : "memories"} from other conversations
                     </>
                   )}
                   {!llmContextPreview.include_memories &&
@@ -3344,7 +3348,7 @@ export default function App() {
                     <dd>
                       {llmContextPreview.memory_count}
                       {llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0
-                        ? ` + ${llmContextPreview.all_memory_count} all`
+                        ? ` + ${llmContextPreview.all_memory_count} other`
                         : ""}
                     </dd>
                   </div>
