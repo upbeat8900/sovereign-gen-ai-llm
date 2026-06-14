@@ -1,8 +1,10 @@
+import re
 import time
 from typing import Callable, List, Optional, Union
 
 from fastapi import HTTPException
 
+from .database import DEFAULT_MULTI_AGENT_PROMPT
 from .llm import chat as llm_chat
 
 
@@ -102,6 +104,17 @@ def participant_display_name(participant: dict) -> str:
     return participant.get("llm_model") or "Assistant"
 
 
+def participant_address_name(participant: dict) -> str:
+    full_name = participant_display_name(participant).strip()
+    if not full_name:
+        return "Assistant"
+    return full_name.split()[0]
+
+
+def strip_leading_speaker_label(content: str) -> str:
+    return re.sub(r"^\[[^\]]+\]:\s*", "", (content or "").strip(), count=1)
+
+
 def previous_discussion_speaker(
     history_rows: List[dict],
     *,
@@ -119,59 +132,35 @@ def previous_discussion_speaker(
     return "the user", None
 
 
-def build_multi_agent_roundtable_prompt(participant: dict, all_participants: List[dict]) -> str:
+def build_multi_agent_roundtable_prompt(
+    participant: dict,
+    all_participants: List[dict],
+    template: str = DEFAULT_MULTI_AGENT_PROMPT,
+) -> str:
     name = participant_display_name(participant)
-    others = [
-        participant_display_name(item)
-        for item in all_participants
-        if item["id"] != participant["id"]
-    ]
-    if not others:
-        cast_line = "You are participating in a fictional roundtable conversation with the user."
-    elif len(others) == 1:
-        cast_line = (
-            "You are participating in a fictional roundtable conversation with the user "
-            f"and one other mentor-like character ({others[0]})."
-        )
-    else:
-        cast_line = (
-            "You are participating in a fictional roundtable conversation with the user "
-            f"and {len(others)} other mentor-like characters ({', '.join(others)})."
-        )
-
-    return (
-        f"{cast_line}\n\n"
-        "The conversation is inspired by public themes associated with well-known motivational, "
-        "personal development, and spiritual teachers, but you must not claim to literally be any real "
-        "person. You are an educational and reflective simulation.\n\n"
-        "Your job is to help the user think deeply, honestly, and practically about their life, goals, "
-        "fears, relationships, work, meaning, habits, and inner growth.\n\n"
-        "You may:\n"
-        "- respond directly to the user;\n"
-        "- build on what another character said;\n"
-        "- respectfully disagree or add nuance;\n"
-        "- ask another character for their view;\n"
-        "- ask the user a thoughtful question;\n"
-        "- summarize tensions or patterns emerging in the conversation.\n\n"
-        "Do not dominate the conversation. Keep responses concise, warm, and conversational unless "
-        "the user asks for depth.\n\n"
-        "When speaking, use your assigned character voice, but avoid catchphrases, exact imitation, "
-        "or claiming private knowledge of any real person.\n\n"
-        "Messages from other participants appear labeled as [Name]: … in the transcript below.\n"
-        "Your reply must contain ONLY what your assigned character would say — first person, in character, "
-        "never a group summary or speaking for others."
-    )
+    prompt_template = (template or "").strip() or DEFAULT_MULTI_AGENT_PROMPT
+    try:
+        rendered = prompt_template.format(character_name=name, cast_line="")
+    except (KeyError, ValueError):
+        rendered = DEFAULT_MULTI_AGENT_PROMPT.format(character_name=name)
+    return rendered.strip()
 
 
-def build_participant_character_instruction(participant: dict, all_participants: List[dict]) -> str:
+def build_participant_character_instruction(
+    participant: dict,
+    all_participants: List[dict],
+    multi_agent_prompt: str = DEFAULT_MULTI_AGENT_PROMPT,
+) -> str:
     name = participant_display_name(participant)
     personality = (participant.get("personality") or "").strip()
     lines = [
-        build_multi_agent_roundtable_prompt(participant, all_participants),
+        build_multi_agent_roundtable_prompt(participant, all_participants, multi_agent_prompt),
         "",
         f'Your assigned character is "{name}".',
         "Every word of your reply must come only from this character, in first person, from their point of view.",
         "Do not speak as, quote at length, or impersonate any other participant or the user.",
+        "When addressing another participant, use only their first name — not their full name.",
+        "Do not prefix your reply with [Name]: or any bracketed speaker label; your message is tagged separately.",
         "Do not break character, mention being an AI, or add meta-commentary about the discussion format.",
     ]
     if personality:
@@ -185,19 +174,36 @@ def build_discussion_response_instruction(
     current_participant: dict,
     all_participants: List[dict],
     previous_speaker_label: str,
+    previous_speaker_address: str,
 ) -> str:
     current_name = participant_display_name(current_participant)
+    novelty_rules = (
+        "Add something genuinely new — do not repeat, paraphrase, or agree by restating points "
+        f"already made in the transcript (including your own earlier [{current_name}]: lines)."
+    )
+    no_label_rule = (
+        "Do not prefix your reply with [Name]: or any bracketed speaker label; your message is tagged separately."
+    )
 
     if previous_speaker_label == "the user":
         return (
             f'As "{current_name}", respond to the user\'s latest message in your character voice. '
-            "The other participants will respond afterward in theirs."
+            f"{novelty_rules} {no_label_rule} The other participants will respond afterward in theirs."
         )
 
     return (
         f'As "{current_name}", respond directly to {previous_speaker_label}\'s most recent message above. '
-        f'Start by addressing them by name (for example, "{previous_speaker_label}, …"). '
-        "React to their specific points from your character's point of view."
+        f'When you address them, use only their first name (for example, "{previous_speaker_address}, …"). '
+        f"{no_label_rule} React to their specific points from your character's point of view. {novelty_rules}"
+    )
+
+
+def build_in_character_final_reminder(current_name: str) -> str:
+    return (
+        f'Before you reply: write only what "{current_name}" would say — '
+        "first person, in character, from their point of view. No other voices. "
+        f"Check the transcript for your earlier [{current_name}]: lines and add new substance only. "
+        "Do not start with [Name]: or bracketed labels. When addressing someone, use their first name only."
     )
 
 
@@ -258,6 +264,8 @@ def run_multi_agent_turns(
                 )
             except (RuntimeError, ValueError) as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            assistant_content = strip_leading_speaker_label(assistant_content)
 
             generation_ms = max(0, int((time.perf_counter() - started_at) * 1000))
             update_generation_stats(

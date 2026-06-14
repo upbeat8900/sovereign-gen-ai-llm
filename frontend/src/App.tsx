@@ -180,6 +180,8 @@ type SpeechConfig = {
 type PromptConfig = {
   default_prompt: string;
   default_prompt_baseline: string;
+  multi_agent_prompt: string;
+  multi_agent_prompt_baseline: string;
   updated_at: string;
 };
 
@@ -1056,13 +1058,84 @@ type GenerationJob = {
   initialMessageCount?: number;
   speakReplies?: boolean;
   autoPlayReplies?: boolean;
+  participants?: ConversationParticipant[];
+  rounds?: number;
+  singleModelName?: string;
+  overrideLlmModelId?: number | null;
 };
+
+type GenerationAgentStep = {
+  key: string;
+  name: string;
+  model: string;
+  round: number | null;
+  status: "done" | "active" | "pending";
+};
+
+function buildGenerationAgentSteps(job: GenerationJob, models: LlmModel[]): GenerationAgentStep[] {
+  const completed = job.completedSteps ?? 0;
+
+  if (!job.isMultiAgent) {
+    const name = job.singleModelName ?? job.modelName;
+    return [
+      {
+        key: "single",
+        name,
+        model: name,
+        round: null,
+        status: completed >= 1 ? "done" : "active",
+      },
+    ];
+  }
+
+  const participants = job.participants ?? [];
+  const rounds = job.rounds ?? 1;
+  const overrideModel =
+    job.overrideLlmModelId != null ? models.find((item) => item.id === job.overrideLlmModelId) : null;
+  const steps: GenerationAgentStep[] = [];
+  let stepIndex = 0;
+
+  for (let round = 0; round < rounds; round += 1) {
+    for (const participant of participants) {
+      let status: GenerationAgentStep["status"] = "pending";
+      if (stepIndex < completed) {
+        status = "done";
+      } else if (stepIndex === completed) {
+        status = "active";
+      }
+
+      const model = models.find((item) => item.id === participant.llm_model_id);
+      steps.push({
+        key: `${participant.id}-round-${round}`,
+        name: participantDisplayName(participant, models),
+        model: overrideModel?.model ?? participant.llm_model ?? model?.model ?? "",
+        round: rounds > 1 ? round + 1 : null,
+        status,
+      });
+      stepIndex += 1;
+    }
+  }
+
+  return steps;
+}
 
 type CompletedGenerationAlert = {
   conversationId: number;
   title: string;
   error?: string;
 };
+
+type AssistantSpeechItem = {
+  conversationId: number;
+  messageId: number;
+  text: string;
+  voiceUri: string;
+  speechRate: number;
+};
+
+function assistantSpeechItemKey(item: AssistantSpeechItem): string {
+  return `${item.messageId}:${item.voiceUri}:${item.speechRate}`;
+}
 
 function participantModelLabel(participant: ParticipantDraft, models: LlmModel[]) {
   const model = models.find((item) => item.id === participant.llm_model_id);
@@ -1076,6 +1149,7 @@ function AgentProfileFields({
   agentProfiles,
   ttsVoiceOptions,
   onPlayVoiceSample,
+  expandedPersonality = false,
 }: {
   draft: ParticipantDraft;
   onChange: (patch: Partial<ParticipantDraft>) => void;
@@ -1083,6 +1157,7 @@ function AgentProfileFields({
   agentProfiles: AgentProfile[];
   ttsVoiceOptions: TtsVoiceOption[];
   onPlayVoiceSample: (voiceUri?: string, speechRate?: number) => void;
+  expandedPersonality?: boolean;
 }) {
   return (
     <div className="agent-profile-form">
@@ -1168,10 +1243,11 @@ function AgentProfileFields({
           Use global speed
         </label>
       </div>
-      <label>
+      <label className={expandedPersonality ? "agent-personality-field" : undefined}>
         Personality / perspective
         <textarea
-          rows={4}
+          className={expandedPersonality ? "agent-personality-textarea" : undefined}
+          rows={expandedPersonality ? 16 : 4}
           value={draft.personality}
           placeholder={`Optional vision for ${participantDisplayName(draft, models)}`}
           onChange={(event) => onChange({ personality: event.target.value })}
@@ -1450,6 +1526,7 @@ export default function App() {
   const [isImportingElevenlabsVoices, setIsImportingElevenlabsVoices] = useState(false);
   const [promptConfig, setPromptConfig] = useState<PromptConfig | null>(null);
   const [defaultPromptDraft, setDefaultPromptDraft] = useState("");
+  const [defaultMultiAgentPromptDraft, setDefaultMultiAgentPromptDraft] = useState("");
   const [ttsVoiceOptions, setTtsVoiceOptions] = useState<TtsVoiceOption[]>([]);
   const [selectedTtsVoiceUri, setSelectedTtsVoiceUri] = useState(
     () => localStorage.getItem(TTS_VOICE_STORAGE_KEY) ?? "",
@@ -1477,7 +1554,9 @@ export default function App() {
   const audioPlaybackRef = useRef<HTMLAudioElement | null>(null);
   const audioBlobUrlRef = useRef<string | null>(null);
   const playbackSessionRef = useRef(0);
-  const speechQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const assistantSpeechQueueRef = useRef<AssistantSpeechItem[]>([]);
+  const assistantSpeechProcessingRef = useRef(false);
+  const ttsPrefetchRef = useRef<{ key: string; promise: Promise<Blob> } | null>(null);
   const elevenlabsCatalogHydratedRef = useRef(false);
   const spokenMessageIdsByConversationRef = useRef<Record<number, Set<number>>>({});
   const speakRepliesByConversationRef = useRef<Record<number, boolean>>({});
@@ -1485,6 +1564,7 @@ export default function App() {
   const generationAbortByConversationRef = useRef(new Map<number, AbortController>());
   const activeIdRef = useRef<number | null>(null);
   const generationJobsRef = useRef<Record<number, GenerationJob>>({});
+  const dismissedProgressModalOnPlaybackRef = useRef<Set<number>>(new Set());
   const editingConversationIdRef = useRef<number | null>(null);
   const speechSelectionRef = useRef<{ messageId: number; text: string } | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -1601,11 +1681,14 @@ export default function App() {
     return config?.models.find((model) => model.id === multiAgentModelOverrideId) ?? null;
   }, [config?.models, multiAgentModelOverrideId]);
   const activeConversationGenerating = activeId != null && activeId in generationJobs;
+  const activeGenerationJob = activeId != null ? generationJobs[activeId] : undefined;
   const progressModalJob =
     progressModalConversationId != null ? generationJobs[progressModalConversationId] ?? null : null;
   const progressModalElapsedSec = progressModalJob
     ? Math.floor((generationClock - progressModalJob.startedAt) / 1000)
     : 0;
+  const progressModalAgentSteps =
+    progressModalJob && config ? buildGenerationAgentSteps(progressModalJob, config.models) : [];
   const chatMessages = useMemo(() => {
     const base = detail?.messages ?? [];
     const job = activeId != null ? generationJobs[activeId] : undefined;
@@ -1986,7 +2069,12 @@ export default function App() {
     revokeAudioBlobUrl();
   }
 
-  function playElevenLabsBlob(blob: Blob, session: number, playbackId: number | "sample"): Promise<void> {
+  function playElevenLabsBlob(
+    blob: Blob,
+    session: number,
+    playbackId: number | "sample",
+    onPlaybackStart?: () => void,
+  ): Promise<void> {
     return new Promise((resolve) => {
       revokeAudioBlobUrl();
       const url = URL.createObjectURL(blob);
@@ -2010,13 +2098,20 @@ export default function App() {
 
       audio.onended = finishPlayback;
       audio.onerror = finishPlayback;
-      void audio.play().catch(finishPlayback);
+      void audio
+        .play()
+        .then(() => {
+          onPlaybackStart?.();
+        })
+        .catch(finishPlayback);
     });
   }
 
   function stopSpeechPlayback() {
     playbackSessionRef.current += 1;
-    speechQueueRef.current = Promise.resolve();
+    assistantSpeechQueueRef.current = [];
+    assistantSpeechProcessingRef.current = false;
+    ttsPrefetchRef.current = null;
     window.speechSynthesis?.cancel();
     stopAudioPlayback();
     speakingMessageIdRef.current = null;
@@ -2024,7 +2119,67 @@ export default function App() {
     setSpeakingMessageId(null);
   }
 
-  async function speakTextAsync(content: string, messageId: number, voiceUri?: string, speechRate?: number): Promise<void> {
+  function startTtsPrefetchForItem(item: AssistantSpeechItem) {
+    if (!isElevenLabsVoiceUri(item.voiceUri)) return;
+    const key = assistantSpeechItemKey(item);
+    if (ttsPrefetchRef.current?.key === key) return;
+    ttsPrefetchRef.current = {
+      key,
+      promise: requestElevenLabsAudio(
+        item.text,
+        parseElevenLabsVoiceId(item.voiceUri),
+        item.speechRate,
+      ),
+    };
+  }
+
+  async function processAssistantSpeechQueue() {
+    if (assistantSpeechProcessingRef.current) return;
+    assistantSpeechProcessingRef.current = true;
+
+    try {
+      while (assistantSpeechQueueRef.current.length > 0) {
+        const item = assistantSpeechQueueRef.current.shift();
+        if (!item) continue;
+        const nextItem = assistantSpeechQueueRef.current[0] ?? null;
+
+        const prefetchKey = assistantSpeechItemKey(item);
+        const prefetchedBlob =
+          ttsPrefetchRef.current?.key === prefetchKey ? ttsPrefetchRef.current.promise : undefined;
+        if (ttsPrefetchRef.current?.key === prefetchKey) {
+          ttsPrefetchRef.current = null;
+        }
+
+        await speakTextAsync(item.text, item.messageId, item.voiceUri, item.speechRate, {
+          prefetchedBlob,
+          onPlaybackStart: () => {
+            maybeDismissProgressModalOnPlaybackStart(item.conversationId);
+            if (nextItem) {
+              startTtsPrefetchForItem(nextItem);
+            }
+          },
+        });
+      }
+    } catch {
+      // Individual playback errors are handled inside speakTextAsync.
+    } finally {
+      assistantSpeechProcessingRef.current = false;
+      if (assistantSpeechQueueRef.current.length > 0) {
+        void processAssistantSpeechQueue();
+      }
+    }
+  }
+
+  async function speakTextAsync(
+    content: string,
+    messageId: number,
+    voiceUri?: string,
+    speechRate?: number,
+    options?: {
+      prefetchedBlob?: Promise<Blob>;
+      onPlaybackStart?: () => void;
+    },
+  ): Promise<void> {
     const plain = content.trim();
     if (!plain) return;
 
@@ -2046,13 +2201,15 @@ export default function App() {
       setSpeakingMessageId(messageId);
 
       try {
-        const blob = await requestElevenLabsAudio(
-          plain,
-          parseElevenLabsVoiceId(resolvedVoiceUri),
-          resolvedSpeechRate,
-        );
+        const blob = options?.prefetchedBlob
+          ? await options.prefetchedBlob
+          : await requestElevenLabsAudio(
+              plain,
+              parseElevenLabsVoiceId(resolvedVoiceUri),
+              resolvedSpeechRate,
+            );
         if (playbackSessionRef.current !== session) return;
-        await playElevenLabsBlob(blob, session, messageId);
+        await playElevenLabsBlob(blob, session, messageId, options?.onPlaybackStart);
       } catch (err) {
         if (playbackSessionRef.current === session) {
           speakingPlaybackRef.current = null;
@@ -2083,6 +2240,9 @@ export default function App() {
         resolve();
       };
 
+      utterance.onstart = () => {
+        options?.onPlaybackStart?.();
+      };
       utterance.onend = finishPlayback;
       utterance.onerror = finishPlayback;
 
@@ -2125,18 +2285,26 @@ export default function App() {
     if (spoken.has(message.id)) return;
     spoken.add(message.id);
 
-    speechQueueRef.current = speechQueueRef.current
-      .then(async () => {
-        const plain = prepareAssistantTextForSpeech(message.content);
-        if (!plain) return;
-        await speakTextAsync(
-          plain,
-          message.id,
-          resolveTtsVoiceUriForMessage(message, participants, config?.models ?? []),
-          resolveTtsSpeechRateForMessage(message, participants, agentProfiles),
-        );
-      })
-      .catch(() => {});
+    const plain = prepareAssistantTextForSpeech(message.content);
+    if (!plain) return;
+
+    const item: AssistantSpeechItem = {
+      conversationId,
+      messageId: message.id,
+      text: plain,
+      voiceUri: resolveTtsVoiceUriForMessage(message, participants, config?.models ?? []),
+      speechRate: resolveTtsSpeechRateForMessage(message, participants, agentProfiles),
+    };
+    assistantSpeechQueueRef.current.push(item);
+
+    const queue = assistantSpeechQueueRef.current;
+    if (assistantSpeechProcessingRef.current) {
+      startTtsPrefetchForItem(item);
+    } else if (queue.length >= 2) {
+      startTtsPrefetchForItem(queue[1]);
+    }
+
+    void processAssistantSpeechQueue();
   }
 
   function maybeSpeakPendingAssistantReplies(
@@ -2509,11 +2677,15 @@ export default function App() {
     try {
       const saved = await request<PromptConfig>("/api/config/prompt", {
         method: "PUT",
-        body: JSON.stringify({ default_prompt: defaultPromptDraft }),
+        body: JSON.stringify({
+          default_prompt: defaultPromptDraft,
+          multi_agent_prompt: defaultMultiAgentPromptDraft,
+        }),
       });
       setPromptConfig(saved);
       setDefaultPromptDraft(saved.default_prompt);
-      showSettingsSaveSuccess("Default prompt saved.");
+      setDefaultMultiAgentPromptDraft(saved.multi_agent_prompt);
+      showSettingsSaveSuccess("Default prompts saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save default prompt");
     }
@@ -2522,6 +2694,11 @@ export default function App() {
   function resetDefaultPrompt() {
     const baseline = promptConfig?.default_prompt_baseline ?? "";
     setDefaultPromptDraft(baseline);
+  }
+
+  function resetDefaultMultiAgentPrompt() {
+    const baseline = promptConfig?.multi_agent_prompt_baseline ?? "";
+    setDefaultMultiAgentPromptDraft(baseline);
   }
 
   function mergeDetailPreservingOptimistic(
@@ -2751,11 +2928,18 @@ export default function App() {
       return next;
     });
     generationAbortByConversationRef.current.delete(conversationId);
+    dismissedProgressModalOnPlaybackRef.current.delete(conversationId);
     setProgressModalConversationId((current) => (current === conversationId ? null : current));
   }
 
   function dismissProgressModal() {
     setProgressModalConversationId(null);
+  }
+
+  function maybeDismissProgressModalOnPlaybackStart(conversationId: number) {
+    if (dismissedProgressModalOnPlaybackRef.current.has(conversationId)) return;
+    dismissedProgressModalOnPlaybackRef.current.add(conversationId);
+    setProgressModalConversationId((current) => (current === conversationId ? null : current));
   }
 
   function cancelGeneration(conversationId?: number) {
@@ -3105,6 +3289,7 @@ export default function App() {
     const data = await request<PromptConfig>("/api/config/prompt");
     setPromptConfig(data);
     setDefaultPromptDraft(data.default_prompt);
+    setDefaultMultiAgentPromptDraft(data.multi_agent_prompt);
   }
 
   async function createConversation(event?: FormEvent) {
@@ -3531,10 +3716,14 @@ export default function App() {
     const totalSteps = isMultiAgentConversation
       ? activeParticipants.length * Math.max(1, Math.min(10, discussionRounds))
       : 1;
+    const roundsForThisSend = isMultiAgentConversation
+      ? Math.max(1, Math.min(10, discussionRounds))
+      : 1;
     const initialMessageCount =
       options?.initialMessageCount ?? persistedMessageCount(detail?.messages);
     const abortController = new AbortController();
     generationAbortByConversationRef.current.set(conversationId, abortController);
+    dismissedProgressModalOnPlaybackRef.current.delete(conversationId);
 
     setGenerationJobs((current) => ({
       ...current,
@@ -3553,6 +3742,10 @@ export default function App() {
         initialMessageCount,
         speakReplies: options?.speakReply ?? false,
         autoPlayReplies: isMultiAgentConversation,
+        participants: isMultiAgentConversation ? activeParticipants : undefined,
+        rounds: roundsForThisSend,
+        overrideLlmModelId: isMultiAgentConversation ? multiAgentModelOverrideId : undefined,
+        singleModelName: isMultiAgentConversation ? undefined : activeModelName,
       },
     }));
     setProgressModalConversationId(conversationId);
@@ -3604,7 +3797,7 @@ export default function App() {
         answer_length: answerLength,
       };
       if (isMultiAgentConversation) {
-        payload.discussion_rounds = Math.max(1, Math.min(10, discussionRounds));
+        payload.discussion_rounds = roundsForThisSend;
         if (multiAgentModelOverrideId != null) {
           payload.override_llm_model_id = multiAgentModelOverrideId;
         }
@@ -3643,6 +3836,11 @@ export default function App() {
       removeGenerationJob(conversationId);
       await loadConversations();
       speakRepliesByConversationRef.current[conversationId] = false;
+
+      if (isMultiAgentConversation && roundsForThisSend > 1) {
+        setDiscussionRounds(1);
+        localStorage.setItem(DISCUSSION_ROUNDS_STORAGE_KEY, "1");
+      }
 
       if (activeIdRef.current === conversationId) {
         if (response.memory) {
@@ -4292,7 +4490,11 @@ export default function App() {
                     ? activeParticipants.find((item) => item.id === message.participant_id)
                     : undefined;
                 return (
-                  <article id={`message-${message.id}`} key={message.id} className={`message ${message.role}`}>
+                  <article
+                    id={`message-${message.id}`}
+                    key={message.id}
+                    className={`message ${message.role}${isSpeaking ? " message-being-read" : ""}`}
+                  >
                     <div className="message-meta">
                       <strong title={participant?.personality?.trim() || undefined}>{speakerLabel}</strong>
                       <span>{formatDate(message.created_at)}</span>
@@ -4442,6 +4644,25 @@ export default function App() {
             )}
 
             <form className="composer" onSubmit={sendMessage}>
+              {activeGenerationJob && (
+                <button
+                  type="button"
+                  className="composer-generating-banner"
+                  onClick={() => activeId != null && setProgressModalConversationId(activeId)}
+                  title="View generation progress"
+                >
+                  <Loader2 size={16} className="spin" aria-hidden="true" />
+                  <span className="composer-generating-banner-text">
+                    {activeGenerationJob.isMultiAgent && activeGenerationJob.totalSteps
+                      ? `Generating · ${Math.min(
+                          activeGenerationJob.completedSteps ?? 0,
+                          activeGenerationJob.totalSteps,
+                        )}/${activeGenerationJob.totalSteps} agents`
+                      : `Generating with ${activeGenerationJob.modelName}`}
+                  </span>
+                  <span className="composer-generating-banner-action">View</span>
+                </button>
+              )}
               {pendingImage && (
                 <div className="composer-attachment">
                   <img src={pendingImage.previewUrl} alt={pendingImage.name ?? "Attached image"} />
@@ -5218,36 +5439,75 @@ export default function App() {
               onSubmit={savePromptConfig}
             >
               <div>
-                <h2>Default prompt</h2>
+                <h2>Default prompts</h2>
                 <p>
-                  This system prompt is sent at the start of every chat reply. Conversation memories are still added
-                  automatically when relevant.
+                  These system prompts are sent at the start of each reply. Conversation memories are still added
+                  automatically when relevant. Per-agent personality and name are appended separately for multi-agent
+                  chats.
                 </p>
               </div>
 
-              <label>
-                System prompt
-                <textarea
-                  className="prompt-settings-textarea"
-                  value={defaultPromptDraft}
-                  onChange={(event) => setDefaultPromptDraft(event.target.value)}
-                  rows={5}
-                />
-              </label>
+              <section className="prompt-settings-section" aria-labelledby="single-agent-prompt-heading">
+                <h3 id="single-agent-prompt-heading">Single-agent chats</h3>
+                <p>Used for normal one-assistant conversations.</p>
+                <label>
+                  System prompt
+                  <textarea
+                    className="prompt-settings-textarea"
+                    value={defaultPromptDraft}
+                    onChange={(event) => setDefaultPromptDraft(event.target.value)}
+                    rows={4}
+                  />
+                </label>
+                <div className="prompt-settings-actions">
+                  <button
+                    type="button"
+                    className="prompt-reset-button"
+                    onClick={resetDefaultPrompt}
+                    disabled={!promptConfig || defaultPromptDraft === promptConfig.default_prompt_baseline}
+                  >
+                    <RotateCcw size={16} />
+                    Reset to default
+                  </button>
+                </div>
+              </section>
 
-              <div className="prompt-settings-actions">
-                <button
-                  type="button"
-                  className="prompt-reset-button"
-                  onClick={resetDefaultPrompt}
-                  disabled={!promptConfig || defaultPromptDraft === promptConfig.default_prompt_baseline}
-                >
-                  <RotateCcw size={16} />
-                  Reset to default
-                </button>
+              <section className="prompt-settings-section" aria-labelledby="multi-agent-prompt-heading">
+                <h3 id="multi-agent-prompt-heading">Multi-agent discussions</h3>
+                <p>
+                  Used instead of the single-agent prompt when a conversation has discussion participants. The placeholder{" "}
+                  <code>{`{character_name}`}</code> is replaced with each agent&apos;s name; who else is in the discussion is
+                  already visible in the labeled transcript below.
+                </p>
+                <label>
+                  Multi-agent system prompt
+                  <textarea
+                    className="prompt-settings-textarea prompt-settings-textarea-multi"
+                    value={defaultMultiAgentPromptDraft}
+                    onChange={(event) => setDefaultMultiAgentPromptDraft(event.target.value)}
+                    rows={22}
+                  />
+                </label>
+                <div className="prompt-settings-actions">
+                  <button
+                    type="button"
+                    className="prompt-reset-button"
+                    onClick={resetDefaultMultiAgentPrompt}
+                    disabled={
+                      !promptConfig ||
+                      defaultMultiAgentPromptDraft === promptConfig.multi_agent_prompt_baseline
+                    }
+                  >
+                    <RotateCcw size={16} />
+                    Reset to default
+                  </button>
+                </div>
+              </section>
+
+              <div className="prompt-settings-actions prompt-settings-save-row">
                 <button type="submit">
                   <Save size={16} />
-                  Save prompt
+                  Save prompts
                 </button>
               </div>
             </form>
@@ -5708,6 +5968,7 @@ export default function App() {
               agentProfiles={agentProfiles}
               ttsVoiceOptions={ttsVoiceOptions}
               onPlayVoiceSample={playModelVoiceSample}
+              expandedPersonality
             />
             <div className="modal-actions">
               <button type="button" className="secondary-button" onClick={closeAgentProfileEditor}>
@@ -6080,6 +6341,37 @@ export default function App() {
               </div>
             </div>
 
+            {progressModalAgentSteps.length > 0 && (
+              <ol className="generation-agent-list" aria-label="Agents generating replies">
+                {progressModalAgentSteps.map((step) => (
+                  <li
+                    key={step.key}
+                    className={`generation-agent-step generation-agent-step-${step.status}`}
+                  >
+                    <span className="generation-agent-step-icon" aria-hidden="true">
+                      {step.status === "done" ? (
+                        <Check size={16} />
+                      ) : step.status === "active" ? (
+                        <Loader2 size={16} className="spin" />
+                      ) : (
+                        <span className="generation-agent-step-pending-dot" />
+                      )}
+                    </span>
+                    <span className="generation-agent-step-body">
+                      <strong>{step.name}</strong>
+                      <span>
+                        {step.model}
+                        {step.round != null ? ` · Round ${step.round}` : ""}
+                        {step.status === "active" ? " · Generating now" : ""}
+                        {step.status === "done" ? " · Done" : ""}
+                        {step.status === "pending" ? " · Waiting" : ""}
+                      </span>
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            )}
+
             {progressModalJob.contextPreview ? (
               <>
                 <p className="llm-context-memories">
@@ -6196,14 +6488,14 @@ export default function App() {
                 className="secondary-button llm-progress-background"
                 onClick={dismissProgressModal}
               >
-                Work in background
+                Close and continue
               </button>
               <button
                 type="button"
                 className="secondary-button llm-progress-cancel"
                 onClick={() => cancelGeneration(progressModalJob.conversationId)}
               >
-                Cancel
+                Stop now
               </button>
             </div>
           </div>

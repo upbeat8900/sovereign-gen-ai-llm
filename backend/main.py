@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .database import (
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_MULTI_AGENT_PROMPT,
     generate_memory_title as fallback_memory_title,
     get_connection,
     init_db,
@@ -33,8 +34,10 @@ from .multi_agent import (
     run_multi_agent_turns,
     clamp_discussion_rounds,
     participant_display_name,
+    participant_address_name,
     previous_discussion_speaker,
     build_discussion_response_instruction,
+    build_in_character_final_reminder,
     build_participant_character_instruction,
 )
 from .stt import WHISPER_MODEL_OPTIONS, get_whisper_model, set_whisper_model, transcribe_audio_bytes
@@ -727,7 +730,11 @@ def _build_llm_messages(
         messages.append(
             {
                 "role": "system",
-                "content": build_participant_character_instruction(participant, all_participants),
+                "content": build_participant_character_instruction(
+                    participant,
+                    all_participants,
+                    prompt_config.get("multi_agent_prompt") or DEFAULT_MULTI_AGENT_PROMPT,
+                ),
             }
         )
     if included_memories:
@@ -747,10 +754,15 @@ def _build_llm_messages(
         def resolve_participant_name(participant_id: int) -> str:
             return _participant_speaker_label(connection, participant_id, participants_by_id)
 
-        previous_speaker_label, _previous_row = previous_discussion_speaker(
+        previous_speaker_label, previous_row = previous_discussion_speaker(
             history_rows,
             resolve_participant_name=resolve_participant_name,
         )
+        previous_speaker_address = previous_speaker_label
+        if previous_row and previous_row.get("participant_id"):
+            previous_participant = participants_by_id.get(previous_row["participant_id"])
+            if previous_participant:
+                previous_speaker_address = participant_address_name(previous_participant)
         messages.append(
             {
                 "role": "system",
@@ -758,6 +770,7 @@ def _build_llm_messages(
                     participant,
                     all_participants,
                     previous_speaker_label,
+                    previous_speaker_address,
                 ),
             }
         )
@@ -767,10 +780,7 @@ def _build_llm_messages(
         messages.append(
             {
                 "role": "system",
-                "content": (
-                    f'Before you reply: write only what "{current_name}" would say — '
-                    "first person, in character, from their point of view. No other voices."
-                ),
+                "content": build_in_character_final_reminder(current_name),
             }
         )
 
@@ -1065,22 +1075,34 @@ def _prompt_config_or_default(connection) -> dict:
     row = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
     if not row:
         connection.execute(
-            "INSERT INTO app_config (id, default_prompt) VALUES (1, ?)",
-            (DEFAULT_SYSTEM_PROMPT,),
+            "INSERT INTO app_config (id, default_prompt, multi_agent_prompt) VALUES (1, ?, ?)",
+            (DEFAULT_SYSTEM_PROMPT, DEFAULT_MULTI_AGENT_PROMPT),
+        )
+        row = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
+    elif not (row.get("multi_agent_prompt") or "").strip():
+        connection.execute(
+            "UPDATE app_config SET multi_agent_prompt = ? WHERE id = 1",
+            (DEFAULT_MULTI_AGENT_PROMPT,),
         )
         row = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
     return row
+
+
+def _public_prompt_config(config: dict) -> dict:
+    return {
+        "default_prompt": config["default_prompt"],
+        "default_prompt_baseline": DEFAULT_SYSTEM_PROMPT,
+        "multi_agent_prompt": (config.get("multi_agent_prompt") or "").strip() or DEFAULT_MULTI_AGENT_PROMPT,
+        "multi_agent_prompt_baseline": DEFAULT_MULTI_AGENT_PROMPT,
+        "updated_at": config["updated_at"],
+    }
 
 
 @app.get("/api/config/prompt", response_model=PromptConfigRead)
 def get_prompt_config() -> dict:
     with get_connection() as connection:
         config = _prompt_config_or_default(connection)
-        return {
-            "default_prompt": config["default_prompt"],
-            "default_prompt_baseline": DEFAULT_SYSTEM_PROMPT,
-            "updated_at": config["updated_at"],
-        }
+        return _public_prompt_config(config)
 
 
 @app.put("/api/config/prompt", response_model=PromptConfigRead)
@@ -1088,23 +1110,22 @@ def update_prompt_config(payload: PromptConfigUpdate) -> dict:
     prompt = payload.default_prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Default prompt cannot be empty")
+    multi_agent_prompt = payload.multi_agent_prompt.strip()
+    if not multi_agent_prompt:
+        raise HTTPException(status_code=400, detail="Multi-agent prompt cannot be empty")
 
     with get_connection() as connection:
         _prompt_config_or_default(connection)
         connection.execute(
             """
             UPDATE app_config
-            SET default_prompt = ?, updated_at = CURRENT_TIMESTAMP
+            SET default_prompt = ?, multi_agent_prompt = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = 1
             """,
-            (prompt,),
+            (prompt, multi_agent_prompt),
         )
         config = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
-        return {
-            "default_prompt": config["default_prompt"],
-            "default_prompt_baseline": DEFAULT_SYSTEM_PROMPT,
-            "updated_at": config["updated_at"],
-        }
+        return _public_prompt_config(config)
 
 
 def _speech_config_or_default(connection) -> dict:

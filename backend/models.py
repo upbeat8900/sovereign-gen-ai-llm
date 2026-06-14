@@ -311,8 +311,11 @@ class ElevenLabsSynthesizeRequest(BaseModel):
 class PromptConfigRead(BaseModel):
     default_prompt: str
     default_prompt_baseline: str
+    multi_agent_prompt: str
+    multi_agent_prompt_baseline: str
     updated_at: str
 
 
 class PromptConfigUpdate(BaseModel):
     default_prompt: str = Field(min_length=1)
+    multi_agent_prompt: str = Field(min_length=1)
