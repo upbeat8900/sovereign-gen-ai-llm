@@ -146,6 +146,26 @@ def build_multi_agent_roundtable_prompt(
     return rendered.strip()
 
 
+def is_multi_agent_discussion(participants: List[dict]) -> bool:
+    return len(participants) > 1
+
+
+def build_single_character_instruction(participant: dict, default_prompt: str) -> str:
+    name = participant_display_name(participant)
+    personality = (participant.get("personality") or "").strip()
+    lines = [
+        (default_prompt or "").strip() or "You are a helpful assistant.",
+        "",
+        f'You are speaking as "{name}". Stay in character — first person, from their point of view.',
+        "Do not break character, mention being an AI, or add meta-commentary.",
+    ]
+    if personality:
+        lines.append(f"Character and perspective:\n{personality}")
+    else:
+        lines.append(f"Embody {name} consistently in how you think, feel, and speak.")
+    return "\n".join(lines)
+
+
 def build_participant_character_instruction(
     participant: dict,
     all_participants: List[dict],

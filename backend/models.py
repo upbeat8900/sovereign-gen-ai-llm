@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import Annotated, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -319,3 +319,157 @@ class PromptConfigRead(BaseModel):
 class PromptConfigUpdate(BaseModel):
     default_prompt: str = Field(min_length=1)
     multi_agent_prompt: str = Field(min_length=1)
+
+
+class MemoryMapNodeSpec(BaseModel):
+    id: str
+    label: str
+    detail: Optional[str] = None
+    memory_ids: List[int] = Field(default_factory=list)
+
+
+class MemoryMapEdgeSpec(BaseModel):
+    source: str
+    target: str
+    label: Optional[str] = None
+
+
+class MemoryMapTreeNodeSpec(BaseModel):
+    id: str
+    label: str
+    detail: Optional[str] = None
+    memory_ids: List[int] = Field(default_factory=list)
+    children: List["MemoryMapTreeNodeSpec"] = Field(default_factory=list)
+
+
+class MemoryMapKanbanCardSpec(BaseModel):
+    id: str
+    title: str
+    body: Optional[str] = None
+    memory_ids: List[int] = Field(default_factory=list)
+
+
+class MemoryMapKanbanColumnSpec(BaseModel):
+    id: str
+    title: str
+    cards: List[MemoryMapKanbanCardSpec] = Field(default_factory=list)
+
+
+class MemoryMapGraphSpec(BaseModel):
+    type: Literal["graph"]
+    title: str
+    nodes: List[MemoryMapNodeSpec]
+    edges: List[MemoryMapEdgeSpec] = Field(default_factory=list)
+
+
+class MemoryMapMindmapSpec(BaseModel):
+    type: Literal["mindmap"]
+    title: str
+    root: MemoryMapTreeNodeSpec
+
+
+class MemoryMapKanbanSpec(BaseModel):
+    type: Literal["kanban"]
+    title: str
+    columns: List[MemoryMapKanbanColumnSpec]
+
+
+class MemoryMapWordSpec(BaseModel):
+    id: str
+    text: str
+    weight: int = Field(ge=1, le=10)
+    memory_ids: List[int] = Field(default_factory=list)
+
+
+class MemoryMapWordcloudSpec(BaseModel):
+    type: Literal["wordcloud"]
+    title: str
+    words: List[MemoryMapWordSpec]
+
+
+MemoryMapSpec = Annotated[
+    Union[MemoryMapGraphSpec, MemoryMapMindmapSpec, MemoryMapKanbanSpec, MemoryMapWordcloudSpec],
+    Field(discriminator="type"),
+]
+
+
+class MemoryMapCreate(BaseModel):
+    include_memories: bool = True
+    include_all_memories: bool = False
+    viz_hint: Literal["graph", "mindmap", "kanban", "wordcloud", "auto"] = "auto"
+
+
+class MemoryMapResponse(BaseModel):
+    viz_id: str
+    spec: MemoryMapGraphSpec | MemoryMapMindmapSpec | MemoryMapKanbanSpec | MemoryMapWordcloudSpec
+
+
+class VizSpecSummary(BaseModel):
+    viz_id: str
+    conversation_id: int
+    title: str
+    spec_type: str
+    memory_count: int
+    created_at: str
+    updated_at: Optional[str] = None
+
+
+class VizClientState(BaseModel):
+    active_view: Literal["graph", "mindmap", "kanban", "wordcloud"]
+    specs: dict
+
+
+class VizClientStateUpdate(BaseModel):
+    active_view: Literal["graph", "mindmap", "kanban", "wordcloud"]
+    specs: dict
+
+
+class VizSpecDetail(BaseModel):
+    viz_id: str
+    conversation_id: int
+    spec: MemoryMapGraphSpec | MemoryMapMindmapSpec | MemoryMapKanbanSpec | MemoryMapWordcloudSpec
+    memories: List[Memory]
+    created_at: str
+    updated_at: Optional[str] = None
+    client_state: Optional[VizClientState] = None
+
+
+class UsageSummary(BaseModel):
+    conversation_count: int
+    total_messages: int
+    user_messages: int
+    assistant_messages: int
+    memory_count: int
+    first_activity: Optional[str] = None
+    last_activity: Optional[str] = None
+
+
+class UsageDailyBucket(BaseModel):
+    date: str
+    user_messages: int
+    assistant_messages: int
+    total_messages: int
+
+
+class UsageModelBucket(BaseModel):
+    provider: str
+    model: str
+    label: str
+    message_count: int
+
+
+class UsageAgentBucket(BaseModel):
+    agent_name: str
+    llm_model: Optional[str] = None
+    message_count: int
+
+
+class UsageStatsRead(BaseModel):
+    days: Optional[int] = None
+    summary: UsageSummary
+    daily: List[UsageDailyBucket]
+    by_model: List[UsageModelBucket]
+    by_agent: List[UsageAgentBucket]
+
+
+MemoryMapTreeNodeSpec.model_rebuild()

@@ -180,6 +180,15 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (llm_model_id) REFERENCES llm_models(id)
             );
+
+            CREATE TABLE IF NOT EXISTS viz_specs (
+                id TEXT PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                spec_json TEXT NOT NULL,
+                memory_ids_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
             """
         )
         _ensure_column(connection, "conversations", "sort_order", "INTEGER")
@@ -205,6 +214,8 @@ def init_db() -> None:
         _ensure_column(connection, "llm_models", "comments", "TEXT")
         _ensure_column(connection, "llm_models", "tts_voice_uri", "TEXT")
         _ensure_column(connection, "speech_config", "elevenlabs_api_key", "TEXT")
+        _ensure_column(connection, "viz_specs", "client_state_json", "TEXT")
+        _ensure_column(connection, "viz_specs", "updated_at", "TEXT")
         _backfill_memory_titles(connection)
         _ensure_column(connection, "memories", "title_generated_at", "TEXT")
         _backfill_memory_title_generated_at(connection)

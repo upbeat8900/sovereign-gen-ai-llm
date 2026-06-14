@@ -10,6 +10,7 @@ import {
   ArrowDownAZ,
   ArrowUp,
   ArrowUpDown,
+  BarChart2,
   Bell,
   Bot,
   ChevronLeft,
@@ -23,6 +24,7 @@ import {
   Loader2,
   MessageCircle,
   Mic,
+  Network,
   Pencil,
   Play,
   Plus,
@@ -36,7 +38,16 @@ import {
 } from "lucide-react";
 
 
-type Page = "chat" | "memories" | "settings";
+type Page = "chat" | "memories" | "settings" | "stats";
+type VizSpecSummary = {
+  viz_id: string;
+  conversation_id: number;
+  title: string;
+  spec_type: string;
+  memory_count: number;
+  created_at: string;
+  updated_at?: string | null;
+};
 type SettingsTab = "models" | "agents" | "prompt" | "speech";
 type ConversationSortMode = "custom" | "recent" | "alphabetical";
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkMath];
@@ -183,6 +194,49 @@ type PromptConfig = {
   multi_agent_prompt: string;
   multi_agent_prompt_baseline: string;
   updated_at: string;
+};
+
+type UsageSummary = {
+  conversation_count: number;
+  total_messages: number;
+  user_messages: number;
+  assistant_messages: number;
+  memory_count: number;
+  first_activity?: string | null;
+  last_activity?: string | null;
+};
+
+type UsageDailyBucket = {
+  date: string;
+  user_messages: number;
+  assistant_messages: number;
+  total_messages: number;
+};
+
+type UsageModelBucket = {
+  provider: string;
+  model: string;
+  label: string;
+  message_count: number;
+};
+
+type UsageAgentBucket = {
+  agent_name: string;
+  llm_model?: string | null;
+  message_count: number;
+};
+
+type UsageStats = {
+  days?: number | null;
+  summary: UsageSummary;
+  daily: UsageDailyBucket[];
+  by_model: UsageModelBucket[];
+  by_agent: UsageAgentBucket[];
+};
+
+type UsageRangeOption = {
+  label: string;
+  days: number | null;
 };
 
 type TtsVoiceOption = {
@@ -1449,6 +1503,107 @@ function ParticipantEditor({
   );
 }
 
+const USAGE_RANGE_OPTIONS: UsageRangeOption[] = [
+  { label: "7 days", days: 7 },
+  { label: "30 days", days: 30 },
+  { label: "90 days", days: 90 },
+  { label: "All time", days: null },
+];
+
+function formatUsageNumber(value: number) {
+  return value.toLocaleString();
+}
+
+function formatUsageDate(value?: string | null) {
+  if (!value) return "—";
+  const parsed = new Date(value.includes("T") ? value : `${value}Z`);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatUsageDayLabel(value: string) {
+  const parsed = new Date(`${value}T12:00:00`);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function UsageDailyChart({ daily }: { daily: UsageDailyBucket[] }) {
+  if (!daily.length) {
+    return <p className="usage-empty">No message activity in this period.</p>;
+  }
+
+  const maxTotal = Math.max(...daily.map((bucket) => bucket.total_messages), 1);
+  const showEveryLabel = daily.length <= 14;
+  const labelStep = showEveryLabel ? 1 : Math.ceil(daily.length / 8);
+
+  return (
+    <div className="usage-daily-chart">
+      <div className="usage-daily-bars" role="img" aria-label="Daily message activity chart">
+        {daily.map((bucket, index) => {
+          const totalHeight = (bucket.total_messages / maxTotal) * 100;
+          const userHeight = bucket.total_messages ? (bucket.user_messages / bucket.total_messages) * totalHeight : 0;
+          const assistantHeight = totalHeight - userHeight;
+          return (
+            <div key={bucket.date} className="usage-daily-bar-column" title={`${formatUsageDayLabel(bucket.date)}: ${bucket.user_messages} sent, ${bucket.assistant_messages} replies`}>
+              <div className="usage-daily-bar-stack" style={{ height: `${Math.max(totalHeight, bucket.total_messages ? 4 : 0)}%` }}>
+                {assistantHeight > 0 && <span className="usage-daily-bar-segment usage-daily-bar-assistant" style={{ flexGrow: assistantHeight }} />}
+                {userHeight > 0 && <span className="usage-daily-bar-segment usage-daily-bar-user" style={{ flexGrow: userHeight }} />}
+              </div>
+              {(index % labelStep === 0 || index === daily.length - 1) && (
+                <span className="usage-daily-bar-label">{formatUsageDayLabel(bucket.date)}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div className="usage-chart-legend">
+        <span><i className="usage-legend-swatch usage-legend-user" /> Your messages</span>
+        <span><i className="usage-legend-swatch usage-legend-assistant" /> AI replies</span>
+      </div>
+    </div>
+  );
+}
+
+function UsageHorizontalBars({
+  items,
+  valueKey,
+  labelKey,
+  subtitleKey,
+}: {
+  items: Array<Record<string, string | number | null | undefined>>;
+  valueKey: string;
+  labelKey: string;
+  subtitleKey?: string;
+}) {
+  if (!items.length) {
+    return <p className="usage-empty">No data for this period.</p>;
+  }
+
+  const maxValue = Math.max(...items.map((item) => Number(item[valueKey] ?? 0)), 1);
+
+  return (
+    <div className="usage-bar-list">
+      {items.map((item) => {
+        const value = Number(item[valueKey] ?? 0);
+        const label = String(item[labelKey] ?? "");
+        const subtitle = subtitleKey ? String(item[subtitleKey] ?? "").trim() : "";
+        return (
+          <div key={`${label}-${subtitle}`} className="usage-bar-row">
+            <div className="usage-bar-row-header">
+              <strong>{label}</strong>
+              <span>{formatUsageNumber(value)}</span>
+            </div>
+            {subtitle && subtitle !== label && <p className="usage-bar-row-subtitle">{subtitle}</p>}
+            <div className="usage-bar-track">
+              <span className="usage-bar-fill" style={{ width: `${(value / maxValue) * 100}%` }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -1465,6 +1620,7 @@ export default function App() {
   const [newTitle, setNewTitle] = useState("");
   const [isNewConversationModalOpen, setIsNewConversationModalOpen] = useState(false);
   const [newConversationMode, setNewConversationMode] = useState<"single" | "multi">("single");
+  const [newConversationSingleCharacterId, setNewConversationSingleCharacterId] = useState<number | null>(null);
   const [newConversationParticipants, setNewConversationParticipants] = useState<ParticipantDraft[]>([]);
   const [isParticipantsModalOpen, setIsParticipantsModalOpen] = useState(false);
   const [participantsDraft, setParticipantsDraft] = useState<ParticipantDraft[]>([]);
@@ -1496,6 +1652,10 @@ export default function App() {
   const [includeMemories, setIncludeMemories] = useState(readStoredIncludeMemories);
   const [includeAllMemories, setIncludeAllMemories] = useState(readStoredIncludeAllMemories);
   const [memorySearch, setMemorySearch] = useState("");
+  const [memoryMapBuilding, setMemoryMapBuilding] = useState(false);
+  const [isMemoryMapsModalOpen, setIsMemoryMapsModalOpen] = useState(false);
+  const [conversationVizList, setConversationVizList] = useState<VizSpecSummary[]>([]);
+  const [memoryMapsModalLoading, setMemoryMapsModalLoading] = useState(false);
   const [memorySort, setMemorySort] = useState<"created_at" | "title" | "llm_model">("created_at");
   const [memoryModelFilter, setMemoryModelFilter] = useState("");
   const [memoryOrder, setMemoryOrder] = useState<"asc" | "desc">("desc");
@@ -1511,6 +1671,9 @@ export default function App() {
   const [config, setConfig] = useState<LlmConfig | null>(null);
   const [configDraft, setConfigDraft] = useState<LlmModel[]>([]);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("models");
+  const [usageStats, setUsageStats] = useState<UsageStats | null>(null);
+  const [usageRangeDays, setUsageRangeDays] = useState<number | null>(30);
+  const [loadingUsageStats, setLoadingUsageStats] = useState(false);
   const [isAddModelModalOpen, setIsAddModelModalOpen] = useState(false);
   const [addModelDraft, setAddModelDraft] = useState<LlmModel>(() => createAddModelDraft(true));
   const [resettingTimingModelId, setResettingTimingModelId] = useState<number | null>(null);
@@ -1570,6 +1733,7 @@ export default function App() {
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingLatestScrollRef = useRef(false);
   const expandConversationMemoriesRef = useRef<number | null>(null);
+  const pendingMemoryGroupScrollRef = useRef<number | null>(null);
 
   const allMemories = useMemo(() => memoryGroups.flatMap((group) => group.memories), [memoryGroups]);
   const displayedElevenlabsCatalogVoices = useMemo(() => {
@@ -1584,6 +1748,16 @@ export default function App() {
     () => allMemories.filter((memory) => memory.conversation_id !== activeId),
     [allMemories, activeId],
   );
+  const mapMemoryCount = useMemo(() => {
+    let count = 0;
+    if (includeMemories) {
+      count += detail?.memories.length ?? 0;
+    }
+    if (includeAllMemories) {
+      count += otherConversationMemories.length;
+    }
+    return count;
+  }, [includeMemories, includeAllMemories, detail?.memories.length, otherConversationMemories.length]);
   const selectedMemories = useMemo(
     () => allMemories.filter((memory) => selectedMemoryIds.includes(memory.id)),
     [allMemories, selectedMemoryIds],
@@ -1676,7 +1850,7 @@ export default function App() {
   }, [config, detail?.conversation.llm_model_id]);
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
   const activeParticipants = detail?.participants ?? [];
-  const isMultiAgentConversation = activeParticipants.length > 0;
+  const isMultiAgentConversation = activeParticipants.length > 1;
   const multiAgentOverrideModel = useMemo(() => {
     if (multiAgentModelOverrideId == null) return null;
     return config?.models.find((model) => model.id === multiAgentModelOverrideId) ?? null;
@@ -1893,6 +2067,11 @@ export default function App() {
   }, [page]);
 
   useEffect(() => {
+    if (page !== "stats") return;
+    void loadUsageStats(usageRangeDays);
+  }, [page, usageRangeDays]);
+
+  useEffect(() => {
     let cancelled = false;
 
     function syncVoices() {
@@ -1954,6 +2133,20 @@ export default function App() {
       setDetail(null);
     }
   }, [activeId]);
+
+  useEffect(() => {
+    if (page !== "memories" || pendingMemoryGroupScrollRef.current == null) {
+      return;
+    }
+    const conversationId = pendingMemoryGroupScrollRef.current;
+    pendingMemoryGroupScrollRef.current = null;
+    requestAnimationFrame(() => {
+      document.getElementById(`memory-group-${conversationId}`)?.scrollIntoView({
+        block: "start",
+        behavior: "smooth",
+      });
+    });
+  }, [page, memoryGroups, expandedMemoryGroupIds, memorySearchTerms]);
 
   useEffect(() => {
     if (page === "memories") {
@@ -3280,6 +3473,19 @@ export default function App() {
     }
   }
 
+  async function loadUsageStats(days: number | null) {
+    setLoadingUsageStats(true);
+    try {
+      const query = days ? `?days=${days}` : "";
+      const data = await request<UsageStats>(`/api/usage/stats${query}`);
+      setUsageStats(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load usage statistics");
+    } finally {
+      setLoadingUsageStats(false);
+    }
+  }
+
   async function loadSpeechConfig(options?: { autoImportVoices?: boolean }) {
     const data = await request<SpeechConfig>("/api/config/speech");
     setSpeechConfig(data);
@@ -3316,6 +3522,11 @@ export default function App() {
         return;
       }
       payload.participants = newConversationParticipants.map(participantPayloadFromDraft);
+    } else if (newConversationSingleCharacterId != null) {
+      const profile = agentProfiles.find((item) => item.id === newConversationSingleCharacterId);
+      if (profile) {
+        payload.participants = [participantPayloadFromDraft(participantDraftFromProfile(profile))];
+      }
     }
     const conversation = await request<Conversation>("/api/conversations", {
       method: "POST",
@@ -3323,6 +3534,7 @@ export default function App() {
     });
     setNewTitle("");
     setNewConversationMode("single");
+    setNewConversationSingleCharacterId(null);
     setNewConversationParticipants([]);
     setIsNewConversationModalOpen(false);
     setConversations((current) => [conversation, ...current]);
@@ -3334,11 +3546,8 @@ export default function App() {
     setError("");
     setNewTitle("");
     setNewConversationMode("single");
-    if (config?.models.length) {
-      setNewConversationParticipants([createParticipantDraft(config.models)]);
-    } else {
-      setNewConversationParticipants([]);
-    }
+    setNewConversationSingleCharacterId(null);
+    setNewConversationParticipants([]);
     setParticipantEditorTarget("new");
     setIsNewConversationModalOpen(true);
   }
@@ -3715,6 +3924,14 @@ export default function App() {
     const content = (overrideContent ?? input).trim();
     const conversationId = activeId;
     if (!conversationId || conversationId in generationJobs || (!content && !image)) return;
+
+    if (!image && content.toLowerCase() === "map memories") {
+      if (!options?.userMessageAlreadyShown) {
+        setInput("");
+      }
+      await createNewMemoryMap();
+      return;
+    }
 
     const conversationTitle =
       detail?.conversation.title ??
@@ -4299,6 +4516,7 @@ export default function App() {
   }
 
   function openConversationMemories(conversationId: number) {
+    setMemorySearch("");
     setExpandedMemoryGroupIds((current) =>
       current.includes(conversationId) ? current : [...current, conversationId],
     );
@@ -4313,7 +4531,70 @@ export default function App() {
     } else {
       expandConversationMemoriesRef.current = conversationId;
     }
+    pendingMemoryGroupScrollRef.current = conversationId;
     setPage("memories");
+  }
+
+  async function loadConversationVizList(conversationId: number) {
+    setMemoryMapsModalLoading(true);
+    try {
+      const items = await request<VizSpecSummary[]>(`/api/conversations/${conversationId}/viz-specs`);
+      setConversationVizList(items);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load memory maps");
+      setConversationVizList([]);
+    } finally {
+      setMemoryMapsModalLoading(false);
+    }
+  }
+
+  function openVizInNewTab(vizId: string) {
+    window.open(`${window.location.origin}/viz/${vizId}`, "_blank", "noopener,noreferrer");
+  }
+
+  function openMemoryMapsModal() {
+    if (!activeId) {
+      return;
+    }
+    setIsMemoryMapsModalOpen(true);
+    void loadConversationVizList(activeId);
+  }
+
+  async function createNewMemoryMap() {
+    if (!activeId || memoryMapBuilding || mapMemoryCount === 0) {
+      return;
+    }
+    if (!includeMemories && !includeAllMemories) {
+      setError("Enable Memories or Other conversations to choose what to map.");
+      return;
+    }
+
+    const popup = window.open("about:blank", "_blank", "noopener,noreferrer");
+    setMemoryMapBuilding(true);
+    setError("");
+    try {
+      const response = await request<{ viz_id: string }>(`/api/conversations/${activeId}/memory-map`, {
+        method: "POST",
+        body: JSON.stringify({
+          include_memories: includeMemories,
+          include_all_memories: includeAllMemories,
+          viz_hint: "auto",
+        }),
+      });
+      const vizUrl = `${window.location.origin}/viz/${response.viz_id}`;
+      if (popup) {
+        popup.location.href = vizUrl;
+      } else {
+        window.open(vizUrl, "_blank", "noopener,noreferrer");
+      }
+      setIsMemoryMapsModalOpen(false);
+      void loadConversationVizList(activeId);
+    } catch (err) {
+      popup?.close();
+      setError(err instanceof Error ? err.message : "Could not build memory map");
+    } finally {
+      setMemoryMapBuilding(false);
+    }
   }
 
   function openDiscussion(conversationId: number) {
@@ -4390,10 +4671,16 @@ export default function App() {
   return (
     <div className={`app-shell ${conversationPaneCollapsed ? "conversation-pane-collapsed" : ""}`}>
       <header className="top-nav">
-        <div className="brand">
+        <button
+          type="button"
+          className={`brand brand-button ${page === "stats" ? "brand-active" : ""}`}
+          onClick={() => setPage("stats")}
+          title="Usage statistics"
+          aria-label="Open usage statistics"
+        >
           <Sparkles size={22} />
           <span>Sovereign Gen AI</span>
-        </div>
+        </button>
         <nav className="top-nav-menu" aria-label="Main navigation">
           <button
             type="button"
@@ -4472,6 +4759,24 @@ export default function App() {
                           <Pencil size={16} />
                         </button>
                       )}
+                      {activeConversation && editingConversationId !== activeConversation.id && (
+                        <button
+                          type="button"
+                          className="conversation-header-memories"
+                          title={
+                            (detail?.memories.length ?? 0) > 0
+                              ? `Open memories for this discussion (${detail?.memories.length ?? 0})`
+                              : "Open memories for this discussion"
+                          }
+                          aria-label="Open memories for this conversation"
+                          onClick={() => openConversationMemories(activeConversation.id)}
+                        >
+                          <Brain size={16} />
+                          {(detail?.memories.length ?? 0) > 0 && (
+                            <span className="conversation-header-memories-count">{detail?.memories.length}</span>
+                          )}
+                        </button>
+                      )}
                     </>
                   )}
                   {activeConversation && editingConversationId !== activeConversation.id && (
@@ -4488,15 +4793,6 @@ export default function App() {
                           Participants
                         </button>
                       )}
-                      <button
-                        type="button"
-                        className="conversation-header-memories"
-                        title="View memories for this conversation"
-                        aria-label="View memories for this conversation"
-                        onClick={() => openConversationMemories(activeConversation.id)}
-                      >
-                        <Brain size={18} />
-                      </button>
                       <button
                         type="button"
                         className="conversation-header-delete"
@@ -4912,6 +5208,20 @@ export default function App() {
                   />
                   Other conversations
                 </label>
+                <button
+                  type="button"
+                  className="composer-map-memories"
+                  title={
+                    mapMemoryCount > 0
+                      ? "Open saved memory maps or create a new one"
+                      : "Save memories first — use Remember on a message or type remember: …"
+                  }
+                  disabled={historyControlsDisabled || mapMemoryCount === 0}
+                  onClick={openMemoryMapsModal}
+                >
+                  <Network size={16} />
+                  Memory maps
+                </button>
                 </div>
                 <label
                   className="composer-answer-length"
@@ -5003,6 +5313,7 @@ export default function App() {
                   return (
                     <section
                       key={group.conversation.id}
+                      id={`memory-group-${group.conversation.id}`}
                       className={`memory-group ${dragOverMemoryGroupId === group.conversation.id ? "memory-group-drag-over" : ""}`}
                       onDragOver={(event) => {
                         event.preventDefault();
@@ -5190,6 +5501,109 @@ export default function App() {
                 </aside>
               )}
             </div>
+          </section>
+        )}
+        {page === "stats" && (
+          <section className="stats-page">
+            <header className="page-header stats-page-header">
+              <div>
+                <p className="eyebrow">Overview</p>
+                <h1>Usage statistics</h1>
+                <p className="stats-page-lead">Your activity across time, models, and agents.</p>
+              </div>
+              <div className="stats-range-toolbar" role="group" aria-label="Time range">
+                {USAGE_RANGE_OPTIONS.map((option) => (
+                  <button
+                    key={option.label}
+                    type="button"
+                    className={usageRangeDays === option.days ? "stats-range-active" : ""}
+                    onClick={() => setUsageRangeDays(option.days)}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </header>
+
+            {loadingUsageStats && !usageStats ? (
+              <div className="usage-loading">
+                <Loader2 size={22} className="spin" />
+                <span>Loading usage statistics…</span>
+              </div>
+            ) : usageStats ? (
+              <div className={`usage-dashboard ${loadingUsageStats ? "usage-dashboard-loading" : ""}`}>
+                <div className="usage-summary-grid">
+                  <article className="usage-summary-card">
+                    <span className="usage-summary-label">Conversations</span>
+                    <strong>{formatUsageNumber(usageStats.summary.conversation_count)}</strong>
+                  </article>
+                  <article className="usage-summary-card">
+                    <span className="usage-summary-label">Messages</span>
+                    <strong>{formatUsageNumber(usageStats.summary.total_messages)}</strong>
+                  </article>
+                  <article className="usage-summary-card">
+                    <span className="usage-summary-label">Your messages</span>
+                    <strong>{formatUsageNumber(usageStats.summary.user_messages)}</strong>
+                  </article>
+                  <article className="usage-summary-card">
+                    <span className="usage-summary-label">AI replies</span>
+                    <strong>{formatUsageNumber(usageStats.summary.assistant_messages)}</strong>
+                  </article>
+                  <article className="usage-summary-card">
+                    <span className="usage-summary-label">Memories saved</span>
+                    <strong>{formatUsageNumber(usageStats.summary.memory_count)}</strong>
+                  </article>
+                  <article className="usage-summary-card usage-summary-card-wide">
+                    <span className="usage-summary-label">Active period</span>
+                    <strong>
+                      {formatUsageDate(usageStats.summary.first_activity)} – {formatUsageDate(usageStats.summary.last_activity)}
+                    </strong>
+                  </article>
+                </div>
+
+                <div className="usage-charts-grid">
+                  <section className="usage-chart-card usage-chart-card-wide">
+                    <div className="usage-chart-card-header">
+                      <BarChart2 size={18} />
+                      <div>
+                        <h2>Activity over time</h2>
+                        <p>Daily message volume</p>
+                      </div>
+                    </div>
+                    <UsageDailyChart daily={usageStats.daily} />
+                  </section>
+
+                  <section className="usage-chart-card">
+                    <div className="usage-chart-card-header">
+                      <Bot size={18} />
+                      <div>
+                        <h2>Models used</h2>
+                        <p>Assistant replies by model</p>
+                      </div>
+                    </div>
+                    <UsageHorizontalBars items={usageStats.by_model} valueKey="message_count" labelKey="label" />
+                  </section>
+
+                  <section className="usage-chart-card">
+                    <div className="usage-chart-card-header">
+                      <Sparkles size={18} />
+                      <div>
+                        <h2>Agents</h2>
+                        <p>Who you talked with</p>
+                      </div>
+                    </div>
+                    <UsageHorizontalBars
+                      items={usageStats.by_agent}
+                      valueKey="message_count"
+                      labelKey="agent_name"
+                      subtitleKey="llm_model"
+                    />
+                  </section>
+                </div>
+              </div>
+            ) : (
+              <p className="usage-empty">Usage statistics are unavailable right now.</p>
+            )}
           </section>
         )}
         {page === "settings" && (
@@ -5888,7 +6302,7 @@ export default function App() {
                     {conversation.title}
                   </strong>
                   <span className="conversation-select-meta">
-                    {(conversation.participant_count ?? 0) > 0 && (
+                    {(conversation.participant_count ?? 0) > 1 && (
                       <span className="conversation-multi-badge" title="Multi-agent discussion">
                         Multi
                       </span>
@@ -5936,6 +6350,65 @@ export default function App() {
         )}
       </aside>
 
+      {isMemoryMapsModalOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setIsMemoryMapsModalOpen(false)}>
+          <div className="modal-card memory-maps-modal" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="memory-maps-modal-header">
+              <div>
+                <p className="eyebrow">Memory maps</p>
+                <h2>{activeConversation?.title ?? "This discussion"}</h2>
+              </div>
+              <button type="button" className="modal-close-button" onClick={() => setIsMemoryMapsModalOpen(false)} aria-label="Close">
+                <X size={18} />
+              </button>
+            </div>
+            <p className="memory-maps-modal-copy">
+              Open a saved map or create a new one from the current memory scope.
+            </p>
+            <div className="memory-maps-modal-actions">
+              <button
+                type="button"
+                className="primary-button"
+                disabled={
+                  memoryMapBuilding ||
+                  mapMemoryCount === 0 ||
+                  (!includeMemories && !includeAllMemories)
+                }
+                onClick={() => void createNewMemoryMap()}
+              >
+                {memoryMapBuilding ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
+                Create new map
+              </button>
+            </div>
+            {memoryMapsModalLoading ? (
+              <div className="memory-maps-modal-loading">
+                <Loader2 size={20} className="spin" />
+                <span>Loading saved maps…</span>
+              </div>
+            ) : conversationVizList.length === 0 ? (
+              <div className="empty-card">No saved maps for this discussion yet.</div>
+            ) : (
+              <ul className="memory-maps-list">
+                {conversationVizList.map((item) => (
+                  <li key={item.viz_id} className="memory-maps-list-item">
+                    <div>
+                      <strong>{item.title}</strong>
+                      <small>
+                        {item.spec_type} · {item.memory_count} memories ·{" "}
+                        {formatDate(item.updated_at ?? item.created_at)}
+                      </small>
+                    </div>
+                    <button type="button" className="secondary-button" onClick={() => openVizInNewTab(item.viz_id)}>
+                      Open
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
+
       {isNewConversationModalOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setIsNewConversationModalOpen(false)}>
           <form className="modal-card new-conversation-modal participants-modal" onSubmit={createConversation} onMouseDown={(event) => event.stopPropagation()}>
@@ -5955,7 +6428,10 @@ export default function App() {
                   type="radio"
                   name="conversation-mode"
                   checked={newConversationMode === "single"}
-                  onChange={() => setNewConversationMode("single")}
+                  onChange={() => {
+                    setNewConversationMode("single");
+                    setNewConversationParticipants([]);
+                  }}
                 />
                 Single model
               </label>
@@ -5966,6 +6442,7 @@ export default function App() {
                   checked={newConversationMode === "multi"}
                   onChange={() => {
                     setNewConversationMode("multi");
+                    setNewConversationSingleCharacterId(null);
                     if (!newConversationParticipants.length && config?.models.length) {
                       setNewConversationParticipants([createParticipantDraft(config.models)]);
                     }
@@ -5974,6 +6451,28 @@ export default function App() {
                 Multi-agent discussion
               </label>
             </div>
+            {newConversationMode === "single" ? (
+              <label className="single-character-picker">
+                Character
+                <select
+                  value={newConversationSingleCharacterId ?? ""}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setNewConversationSingleCharacterId(value ? Number(value) : null);
+                  }}
+                >
+                  <option value="">Generic assistant</option>
+                  {agentProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
+                {!agentProfiles.length ? (
+                  <span className="hint">No saved agents yet — use Settings → Agents to add characters.</span>
+                ) : null}
+              </label>
+            ) : null}
             {newConversationMode === "multi" && config?.models.length ? (
               <ParticipantEditor
                 participants={newConversationParticipants}

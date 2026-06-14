@@ -8,7 +8,7 @@ from typing import List, Optional, Union
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .database import (
@@ -33,15 +33,18 @@ from .multi_agent import (
     replace_participants,
     run_multi_agent_turns,
     clamp_discussion_rounds,
+    is_multi_agent_discussion,
     participant_display_name,
     participant_address_name,
     previous_discussion_speaker,
     build_discussion_response_instruction,
     build_in_character_final_reminder,
     build_participant_character_instruction,
+    build_single_character_instruction,
 )
 from .stt import WHISPER_MODEL_OPTIONS, get_whisper_model, set_whisper_model, transcribe_audio_bytes
 from .tts import list_elevenlabs_voices, synthesize_elevenlabs_speech
+from .memory_map import create_memory_map, get_viz_spec_detail, list_conversation_viz_specs, update_viz_client_state
 from .models import (
     AgentProfileCreate,
     AgentProfileRead,
@@ -65,6 +68,8 @@ from .models import (
     Memory,
     MemoryGroup,
     MemoryIntegrate,
+    MemoryMapCreate,
+    MemoryMapResponse,
     MemoryMerge,
     MemoryMove,
     MessageCreate,
@@ -74,6 +79,10 @@ from .models import (
     PromptConfigUpdate,
     SpeechConfigRead,
     SpeechConfigUpdate,
+    UsageStatsRead,
+    VizSpecDetail,
+    VizClientStateUpdate,
+    VizSpecSummary,
 )
 
 
@@ -727,16 +736,18 @@ def _build_llm_messages(
         all_participants = load_participants(connection, conversation_id)
         for item in all_participants:
             participants_by_id[item["id"]] = item
-        messages.append(
-            {
-                "role": "system",
-                "content": build_participant_character_instruction(
-                    participant,
-                    all_participants,
-                    prompt_config.get("multi_agent_prompt") or DEFAULT_MULTI_AGENT_PROMPT,
-                ),
-            }
-        )
+        if is_multi_agent_discussion(all_participants):
+            character_instruction = build_participant_character_instruction(
+                participant,
+                all_participants,
+                prompt_config.get("multi_agent_prompt") or DEFAULT_MULTI_AGENT_PROMPT,
+            )
+        else:
+            character_instruction = build_single_character_instruction(
+                participant,
+                prompt_config["default_prompt"],
+            )
+        messages.append({"role": "system", "content": character_instruction})
     if included_memories:
         memory_text = "\n".join(f"- {memory['content']}" for memory in included_memories)
         messages.append({"role": "system", "content": f"Conversation memory bank:\n{memory_text}"})
@@ -1383,7 +1394,7 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
         conversation = _conversation_or_404(connection, conversation_id)
         participants = load_participants(connection, conversation_id)
         multi_agent_note = None
-        if participants:
+        if is_multi_agent_discussion(participants):
             preview_model_id = payload.override_llm_model_id or participants[0]["llm_model_id"]
             config = _llm_model_or_404(connection, preview_model_id)
             if payload.override_llm_model_id:
@@ -1396,6 +1407,8 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
                     f"Multi-agent preview for first participant ({config['model']}). "
                     "Other participants use the same shared context with different models and personalities."
                 )
+        elif participants:
+            config = _llm_model_or_404(connection, participants[0]["llm_model_id"])
         else:
             config = _conversation_llm_model(connection, conversation)
         llm_messages, included_memory_count, included_all_memory_count = _build_llm_messages(
@@ -1468,7 +1481,7 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
             connection.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
 
         participants = load_participants(connection, conversation_id)
-        if participants:
+        if is_multi_agent_discussion(participants):
             if payload.override_llm_model_id is not None:
                 _llm_model_or_404(connection, payload.override_llm_model_id)
             discussion_rounds = clamp_discussion_rounds(payload.discussion_rounds)
@@ -1497,7 +1510,11 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
                 "assistant_messages": assistant_messages,
             }
 
-        config = _conversation_llm_model(connection, conversation)
+        participant = participants[0] if participants else None
+        if participant:
+            config = _llm_model_or_404(connection, participant["llm_model_id"])
+        else:
+            config = _conversation_llm_model(connection, conversation)
         llm_messages, included_memory_count, included_all_memory_count = _build_llm_messages(
             connection,
             conversation_id,
@@ -1505,6 +1522,7 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
             include_history=payload.include_history,
             include_memories=payload.include_memories,
             include_all_memories=payload.include_all_memories,
+            participant=participant,
             answer_length=payload.answer_length,
         )
         context_summary = _summarize_llm_context(
@@ -1547,6 +1565,7 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
             llm_model=config["model"],
             generation_ms=generation_ms,
             include_history=_stored_include_history(payload.include_history),
+            participant_id=participant["id"] if participant else None,
         )
         return {"user_message": user_message, "assistant_message": assistant_message}
 
@@ -1728,6 +1747,30 @@ def integrate_memories(payload: MemoryIntegrate, background_tasks: BackgroundTas
         return _schedule_memory_title_generation(background_tasks, integrated, target_conversation_id)
 
 
+@app.post("/api/conversations/{conversation_id}/memory-map", response_model=MemoryMapResponse)
+def generate_memory_map(conversation_id: int, payload: MemoryMapCreate) -> MemoryMapResponse:
+    with get_connection() as connection:
+        return create_memory_map(connection, conversation_id, payload)
+
+
+@app.get("/api/viz-specs/{viz_id}", response_model=VizSpecDetail)
+def read_viz_spec(viz_id: str) -> VizSpecDetail:
+    with get_connection() as connection:
+        return get_viz_spec_detail(connection, viz_id)
+
+
+@app.get("/api/conversations/{conversation_id}/viz-specs", response_model=List[VizSpecSummary])
+def read_conversation_viz_specs(conversation_id: int) -> List[VizSpecSummary]:
+    with get_connection() as connection:
+        return list_conversation_viz_specs(connection, conversation_id)
+
+
+@app.put("/api/viz-specs/{viz_id}/client-state", response_model=VizSpecDetail)
+def save_viz_client_state(viz_id: str, payload: VizClientStateUpdate) -> VizSpecDetail:
+    with get_connection() as connection:
+        return update_viz_client_state(connection, viz_id, payload)
+
+
 @app.post("/api/conversations/{conversation_id}/memories/merge", response_model=Memory)
 def merge_memories(conversation_id: int, payload: MemoryMerge, background_tasks: BackgroundTasks) -> dict:
     memory_ids = sorted(set(payload.memory_ids))
@@ -1754,6 +1797,191 @@ def merge_memories(conversation_id: int, payload: MemoryMerge, background_tasks:
             [conversation_id, *memory_ids],
         )
         return _schedule_memory_title_generation(background_tasks, merged, conversation_id)
+
+
+def _usage_date_filter(days: Optional[int]) -> tuple[str, list]:
+    if days is not None and days > 0:
+        return "AND created_at >= datetime('now', ?)", [f"-{int(days)} days"]
+    return "", []
+
+
+def _usage_agent_label(row: dict) -> str:
+    if row.get("participant_id"):
+        participant = {
+            "name": row.get("participant_name") or "",
+            "llm_model": row.get("participant_llm_model") or row.get("llm_model"),
+            "llm_comments": row.get("llm_comments") or "",
+        }
+        return participant_display_name(participant)
+    profile_name = (row.get("profile_name") or "").strip()
+    if profile_name:
+        return profile_name
+    model = (row.get("llm_model") or "").strip()
+    if model:
+        return f"Assistant ({model})"
+    return "Assistant"
+
+
+def _load_usage_stats(connection, days: Optional[int] = None) -> dict:
+    from datetime import date, timedelta
+
+    message_date_filter, message_date_params = _usage_date_filter(days)
+    memory_date_filter, memory_date_params = _usage_date_filter(days)
+
+    conversation_count = connection.execute("SELECT COUNT(*) AS count FROM conversations").fetchone()["count"]
+    message_summary = connection.execute(
+        f"""
+        SELECT
+            COUNT(*) AS total_messages,
+            SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS user_messages,
+            SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) AS assistant_messages,
+            MIN(created_at) AS first_activity,
+            MAX(created_at) AS last_activity
+        FROM messages
+        WHERE role IN ('user', 'assistant')
+        {message_date_filter}
+        """,
+        message_date_params,
+    ).fetchone()
+    memory_count = connection.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM memories
+        WHERE archived_at IS NULL
+        {memory_date_filter}
+        """,
+        memory_date_params,
+    ).fetchone()["count"]
+
+    daily_rows = connection.execute(
+        f"""
+        SELECT
+            DATE(created_at) AS bucket_date,
+            SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS user_messages,
+            SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) AS assistant_messages,
+            COUNT(*) AS total_messages
+        FROM messages
+        WHERE role IN ('user', 'assistant')
+        {message_date_filter}
+        GROUP BY DATE(created_at)
+        ORDER BY bucket_date ASC
+        """,
+        message_date_params,
+    ).fetchall()
+
+    daily_lookup = {
+        row["bucket_date"]: {
+            "date": row["bucket_date"],
+            "user_messages": int(row["user_messages"]),
+            "assistant_messages": int(row["assistant_messages"]),
+            "total_messages": int(row["total_messages"]),
+        }
+        for row in daily_rows
+    }
+
+    daily: list[dict] = []
+    if daily_lookup:
+        start_date = min(daily_lookup.keys())
+        end_date = max(daily_lookup.keys())
+        cursor = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        while cursor <= end:
+            key = cursor.isoformat()
+            daily.append(
+                daily_lookup.get(
+                    key,
+                    {
+                        "date": key,
+                        "user_messages": 0,
+                        "assistant_messages": 0,
+                        "total_messages": 0,
+                    },
+                )
+            )
+            cursor += timedelta(days=1)
+
+    model_rows = connection.execute(
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(llm_provider), ''), 'unknown') AS provider,
+            COALESCE(NULLIF(TRIM(llm_model), ''), 'unknown') AS model,
+            COUNT(*) AS message_count
+        FROM messages
+        WHERE role = 'assistant'
+        {message_date_filter}
+        GROUP BY provider, model
+        ORDER BY message_count DESC, model ASC
+        """,
+        message_date_params,
+    ).fetchall()
+
+    agent_rows = connection.execute(
+        f"""
+        SELECT
+            m.participant_id,
+            m.llm_model,
+            cp.name AS participant_name,
+            lm.model AS participant_llm_model,
+            lm.comments AS llm_comments,
+            ap.name AS profile_name,
+            COUNT(*) AS message_count
+        FROM messages m
+        LEFT JOIN conversation_participants cp ON cp.id = m.participant_id
+        LEFT JOIN llm_models lm ON lm.id = cp.llm_model_id
+        LEFT JOIN agent_profiles ap ON ap.id = cp.agent_profile_id
+        WHERE m.role = 'assistant'
+        {message_date_filter.replace('created_at', 'm.created_at') if message_date_filter else ''}
+        GROUP BY
+            m.participant_id,
+            m.llm_model,
+            cp.name,
+            lm.model,
+            lm.comments,
+            ap.name
+        """,
+        message_date_params,
+    ).fetchall()
+
+    agent_totals: dict[str, dict] = {}
+    for row in agent_rows:
+        label = _usage_agent_label(dict(row))
+        model = (row["llm_model"] or row["participant_llm_model"] or "").strip() or None
+        bucket = agent_totals.setdefault(label, {"agent_name": label, "llm_model": model, "message_count": 0})
+        if not bucket["llm_model"] and model:
+            bucket["llm_model"] = model
+        bucket["message_count"] += int(row["message_count"])
+
+    by_agent = sorted(agent_totals.values(), key=lambda item: (-item["message_count"], item["agent_name"].lower()))
+
+    return {
+        "days": days,
+        "summary": {
+            "conversation_count": int(conversation_count),
+            "total_messages": int(message_summary["total_messages"] or 0),
+            "user_messages": int(message_summary["user_messages"] or 0),
+            "assistant_messages": int(message_summary["assistant_messages"] or 0),
+            "memory_count": int(memory_count or 0),
+            "first_activity": message_summary["first_activity"],
+            "last_activity": message_summary["last_activity"],
+        },
+        "daily": daily,
+        "by_model": [
+            {
+                "provider": row["provider"],
+                "model": row["model"],
+                "label": f"{row['provider']} / {row['model']}" if row["provider"] != "unknown" else row["model"],
+                "message_count": int(row["message_count"]),
+            }
+            for row in model_rows
+        ],
+        "by_agent": by_agent,
+    }
+
+
+@app.get("/api/usage/stats", response_model=UsageStatsRead)
+def get_usage_stats(days: Optional[int] = Query(default=None, ge=1, le=3650)) -> dict:
+    with get_connection() as connection:
+        return _load_usage_stats(connection, days)
 
 
 @app.get("/api/config/llm", response_model=LlmConfigRead)
@@ -1844,5 +2072,15 @@ def update_llm_config(payload: LlmConfigUpdate) -> dict:
 
 
 frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+frontend_index = frontend_dist / "index.html"
+
+
+@app.get("/viz/{_rest:path}")
+def serve_viz_spa(_rest: str) -> FileResponse:
+    if not frontend_index.exists():
+        raise HTTPException(status_code=404, detail="Frontend build not found")
+    return FileResponse(frontend_index)
+
+
 if frontend_dist.exists():
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
