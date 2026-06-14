@@ -160,6 +160,49 @@ button {
   align-items: center;
   display: flex;
   gap: 10px;
+  min-width: 0;
+}
+
+.conversation-header-title {
+  cursor: text;
+}
+
+.conversation-header-title:hover {
+  color: #1d4ed8;
+}
+
+.conversation-header-title-input {
+  background: #ffffff;
+  border: 1px solid #60a5fa;
+  border-radius: 10px;
+  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18);
+  color: #0f172a;
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1.1;
+  margin: 0;
+  min-width: 0;
+  outline: none;
+  padding: 4px 10px;
+  width: min(100%, 520px);
+}
+
+.conversation-header-rename {
+  align-items: center;
+  background: #e2e8f0;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  color: #475569;
+  display: inline-flex;
+  flex-shrink: 0;
+  justify-content: center;
+  padding: 8px;
+}
+
+.conversation-header-rename:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1d4ed8;
 }
 
 .conversation-header-delete {
@@ -806,8 +849,35 @@ button:disabled {
   align-items: center;
   display: flex;
   gap: 4px;
-  justify-content: flex-end;
+  justify-content: space-between;
   margin-bottom: 18px;
+}
+
+.conversation-sort-controls {
+  display: flex;
+  gap: 4px;
+}
+
+.conversation-sort-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  color: #94a3b8;
+  display: inline-flex;
+  flex-shrink: 0;
+  justify-content: center;
+  padding: 8px;
+}
+
+.conversation-sort-button:hover {
+  background: #1f2937;
+  color: #e2e8f0;
+}
+
+.conversation-sort-button.conversation-sort-active {
+  background: #374151;
+  color: #60a5fa;
 }
 
 .conversation-pane.conversation-pane-is-collapsed {
@@ -841,6 +911,7 @@ button:disabled {
   display: inline-flex;
   flex-shrink: 0;
   justify-content: center;
+  margin-left: auto;
   padding: 8px;
 }
 
@@ -895,13 +966,46 @@ button:disabled {
   background: #1f2937;
   border: 1px solid transparent;
   border-radius: 16px;
-  cursor: grab;
+  cursor: default;
   display: block;
   padding: 8px;
 }
 
-.conversation-item:active {
+.conversation-item-draggable {
+  cursor: grab;
+}
+
+.conversation-item-draggable:active {
   cursor: grabbing;
+}
+
+.conversation-item-main {
+  align-items: stretch;
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+
+.conversation-rename-button {
+  align-self: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: #94a3b8;
+  flex-shrink: 0;
+  opacity: 0;
+  padding: 6px;
+  transition: opacity 0.15s ease;
+}
+
+.conversation-item:hover .conversation-rename-button,
+.conversation-item:focus-within .conversation-rename-button {
+  opacity: 1;
+}
+
+.conversation-rename-button:hover {
+  background: #374151;
+  color: #f8fafc;
 }
 
 .conversation-select {
@@ -960,6 +1064,19 @@ button:disabled {
   border-radius: 999px;
   color: #c4b5fd;
   cursor: pointer;
+  display: inline-flex !important;
+  font-size: 11px !important;
+  font-weight: 700;
+  gap: 5px;
+  margin-top: 0 !important;
+  padding: 2px 8px;
+}
+
+.conversation-unreviewed-pill {
+  align-items: center;
+  background: rgba(34, 197, 94, 0.18);
+  border-radius: 999px;
+  color: #86efac;
   display: inline-flex !important;
   font-size: 11px !important;
   font-weight: 700;

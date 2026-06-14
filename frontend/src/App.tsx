@@ -6,17 +6,22 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
   ArrowDown,
+  ArrowDownAZ,
   ArrowUp,
+  Bell,
   Bot,
   ChevronLeft,
   ChevronRight,
+  Clock,
   Brain,
   Check,
   FileDown,
+  GripVertical,
   ImagePlus,
   Loader2,
   MessageCircle,
   Mic,
+  Pencil,
   Play,
   Plus,
   RotateCcw,
@@ -30,6 +35,7 @@ import {
 
 
 type Page = "chat" | "memories" | "settings";
+type ConversationSortMode = "custom" | "recent" | "alphabetical";
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkMath];
 const MARKDOWN_REHYPE_PLUGINS = [rehypeKatex];
 
@@ -154,6 +160,7 @@ const CURRENT_MESSAGE_ONLY_STORAGE_KEY = "chat_current_message_only";
 const HISTORY_MESSAGE_LIMIT_STORAGE_KEY = "chat_history_message_limit";
 const INCLUDE_MEMORIES_STORAGE_KEY = "chat_include_memories";
 const INCLUDE_ALL_MEMORIES_STORAGE_KEY = "chat_include_all_memories";
+const CONVERSATION_SORT_STORAGE_KEY = "chat_conversation_sort";
 const HISTORY_FULL_SENTINEL = -1;
 const LLM_HISTORY_DB_CAP = 40;
 
@@ -258,6 +265,40 @@ function readStoredIncludeAllMemories(): boolean {
 
 function persistIncludeAllMemories(value: boolean) {
   localStorage.setItem(INCLUDE_ALL_MEMORIES_STORAGE_KEY, String(value));
+}
+
+function readStoredConversationSortMode(): ConversationSortMode {
+  const stored = localStorage.getItem(CONVERSATION_SORT_STORAGE_KEY);
+  if (stored === "custom" || stored === "recent" || stored === "alphabetical") {
+    return stored;
+  }
+  return "custom";
+}
+
+function persistConversationSortMode(mode: ConversationSortMode) {
+  localStorage.setItem(CONVERSATION_SORT_STORAGE_KEY, mode);
+}
+
+function sortConversations(conversations: Conversation[], mode: ConversationSortMode) {
+  const list = [...conversations];
+  if (mode === "recent") {
+    return list.sort(
+      (left, right) =>
+        new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime() || right.id - left.id,
+    );
+  }
+  if (mode === "alphabetical") {
+    return list.sort(
+      (left, right) =>
+        left.title.localeCompare(right.title, undefined, { sensitivity: "base" }) || left.id - right.id,
+    );
+  }
+  return list.sort(
+    (left, right) =>
+      left.sort_order - right.sort_order ||
+      new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime() ||
+      right.id - left.id,
+  );
 }
 
 function clampHistoryContextTotal(next: number, min: number, max: number) {
@@ -681,6 +722,7 @@ export default function App() {
   const [generationJobs, setGenerationJobs] = useState<Record<number, GenerationJob>>({});
   const [progressModalConversationId, setProgressModalConversationId] = useState<number | null>(null);
   const [completedGenerationAlert, setCompletedGenerationAlert] = useState<CompletedGenerationAlert | null>(null);
+  const [unreviewedReplyConversationIds, setUnreviewedReplyConversationIds] = useState<number[]>([]);
   const [generationClock, setGenerationClock] = useState(() => Date.now());
   const [historyMessageLimit, setHistoryMessageLimit] = useState(readStoredHistoryMessageLimit);
   const [includeMemories, setIncludeMemories] = useState(readStoredIncludeMemories);
@@ -718,6 +760,7 @@ export default function App() {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<number | null>(null);
   const [conversationPaneCollapsed, setConversationPaneCollapsed] = useState(false);
+  const [conversationSortMode, setConversationSortMode] = useState(readStoredConversationSortMode);
   const skipConversationTitleSaveRef = useRef(false);
   const isRecordingRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -728,6 +771,7 @@ export default function App() {
   const playbackSessionRef = useRef(0);
   const generationAbortByConversationRef = useRef(new Map<number, AbortController>());
   const activeIdRef = useRef<number | null>(null);
+  const editingConversationIdRef = useRef<number | null>(null);
   const speechSelectionRef = useRef<{ messageId: number; text: string } | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingLatestScrollRef = useRef(false);
@@ -808,6 +852,17 @@ export default function App() {
       conversation.updated_at > latest.updated_at ? conversation : latest,
     );
   }, [conversations]);
+  const displayedConversations = useMemo(
+    () => sortConversations(conversations, conversationSortMode),
+    [conversations, conversationSortMode],
+  );
+  const activeConversation = useMemo(() => {
+    if (activeId == null) return null;
+    const fromList = conversations.find((conversation) => conversation.id === activeId);
+    if (fromList) return fromList;
+    if (detail?.conversation.id === activeId) return detail.conversation;
+    return null;
+  }, [activeId, conversations, detail?.conversation]);
   const deleteDestinationConversations = useMemo(
     () => conversations.filter((conversation) => conversation.id !== deleteConversationTarget?.id),
     [conversations, deleteConversationTarget?.id],
@@ -932,6 +987,10 @@ export default function App() {
   }, [activeId]);
 
   useEffect(() => {
+    editingConversationIdRef.current = editingConversationId;
+  }, [editingConversationId]);
+
+  useEffect(() => {
     if (!Object.keys(generationJobs).length) return;
     const intervalId = window.setInterval(() => setGenerationClock(Date.now()), 1000);
     return () => window.clearInterval(intervalId);
@@ -972,7 +1031,12 @@ export default function App() {
 
   useEffect(() => {
     stopSpeechPlayback();
+    setEditingConversationId(null);
+    setEditingConversationTitle("");
     if (activeId) {
+      setUnreviewedReplyConversationIds((current) =>
+        current.includes(activeId) ? current.filter((id) => id !== activeId) : current,
+      );
       loadConversation(activeId);
       setIsConversationModelModalOpen(false);
       setExpandedMemoryIds([]);
@@ -1348,6 +1412,17 @@ export default function App() {
     generationAbortByConversationRef.current.get(targetId)?.abort();
   }
 
+  function dismissCompletedGenerationAlert() {
+    if (!completedGenerationAlert) return;
+    const { conversationId, error } = completedGenerationAlert;
+    setCompletedGenerationAlert(null);
+    if (!error && activeIdRef.current !== conversationId) {
+      setUnreviewedReplyConversationIds((current) =>
+        current.includes(conversationId) ? current : [...current, conversationId],
+      );
+    }
+  }
+
   async function goToCompletedAnswer() {
     const alert = completedGenerationAlert;
     if (!alert) return;
@@ -1480,27 +1555,37 @@ export default function App() {
   function startEditingConversationTitle(conversation: Conversation) {
     skipConversationTitleSaveRef.current = false;
     setError("");
+    editingConversationIdRef.current = conversation.id;
     setEditingConversationId(conversation.id);
     setEditingConversationTitle(conversation.title);
   }
 
   function cancelConversationTitleEdit() {
     skipConversationTitleSaveRef.current = true;
+    editingConversationIdRef.current = null;
     setEditingConversationId(null);
     setEditingConversationTitle("");
   }
 
-  async function saveConversationTitle(conversation: Conversation) {
+  async function saveConversationTitle(conversation: Conversation, nextTitle?: string) {
     if (skipConversationTitleSaveRef.current) {
       skipConversationTitleSaveRef.current = false;
       return;
     }
+    if (editingConversationIdRef.current !== conversation.id) {
+      return;
+    }
 
-    const title = editingConversationTitle.trim() || "New Conversation";
+    const title = (nextTitle ?? editingConversationTitle).trim() || "New Conversation";
+    skipConversationTitleSaveRef.current = true;
+    editingConversationIdRef.current = null;
     setEditingConversationId(null);
     setEditingConversationTitle("");
 
-    if (title === conversation.title) return;
+    if (title === conversation.title) {
+      skipConversationTitleSaveRef.current = false;
+      return;
+    }
 
     setError("");
     try {
@@ -1523,18 +1608,25 @@ export default function App() {
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not update discussion title");
+    } finally {
+      skipConversationTitleSaveRef.current = false;
     }
   }
 
   function handleConversationTitleKeyDown(event: KeyboardEvent<HTMLInputElement>, conversation: Conversation) {
     if (event.key === "Enter") {
       event.preventDefault();
-      event.currentTarget.blur();
+      void saveConversationTitle(conversation, event.currentTarget.value);
     }
     if (event.key === "Escape") {
       event.preventDefault();
       cancelConversationTitleEdit();
     }
+  }
+
+  function changeConversationSortMode(mode: ConversationSortMode) {
+    setConversationSortMode(mode);
+    persistConversationSortMode(mode);
   }
 
   async function persistConversationOrder(nextConversations: Conversation[]) {
@@ -1552,13 +1644,17 @@ export default function App() {
 
   function moveConversation(draggedId: number, targetId: number) {
     if (draggedId === targetId) return;
-    const fromIndex = conversations.findIndex((conversation) => conversation.id === draggedId);
-    const toIndex = conversations.findIndex((conversation) => conversation.id === targetId);
+    const currentList = sortConversations(conversations, conversationSortMode);
+    const fromIndex = currentList.findIndex((conversation) => conversation.id === draggedId);
+    const toIndex = currentList.findIndex((conversation) => conversation.id === targetId);
     if (fromIndex === -1 || toIndex === -1) return;
 
-    const nextConversations = [...conversations];
+    const nextConversations = [...currentList];
     const [moved] = nextConversations.splice(fromIndex, 1);
     nextConversations.splice(toIndex, 0, moved);
+    if (conversationSortMode !== "custom") {
+      changeConversationSortMode("custom");
+    }
     setConversations(nextConversations);
     void persistConversationOrder(nextConversations);
   }
@@ -2369,13 +2465,50 @@ export default function App() {
               <div>
                 <p className="eyebrow">Conversation</p>
                 <div className="conversation-title-row">
-                  <h1>{detail?.conversation.title ?? "Start a conversation"}</h1>
-                  {detail && activeId && (
+                  {activeConversation && editingConversationId === activeConversation.id ? (
+                    <input
+                      className="conversation-header-title-input"
+                      autoFocus
+                      value={editingConversationTitle}
+                      onChange={(event) => setEditingConversationTitle(event.target.value)}
+                      onBlur={(event) => void saveConversationTitle(activeConversation, event.currentTarget.value)}
+                      onFocus={(event) => event.currentTarget.select()}
+                      onKeyDown={(event) => handleConversationTitleKeyDown(event, activeConversation)}
+                      aria-label="Conversation title"
+                    />
+                  ) : (
+                    <>
+                      <h1
+                        className={activeConversation ? "conversation-header-title" : undefined}
+                        title={activeConversation ? "Click to rename" : undefined}
+                        onClick={
+                          activeConversation
+                            ? () => startEditingConversationTitle(activeConversation)
+                            : undefined
+                        }
+                      >
+                        {activeConversation?.title ?? "Start a conversation"}
+                      </h1>
+                      {activeConversation && (
+                        <button
+                          type="button"
+                          className="conversation-header-rename"
+                          title="Rename conversation"
+                          aria-label="Rename conversation"
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => startEditingConversationTitle(activeConversation)}
+                        >
+                          <Pencil size={16} />
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {activeConversation && editingConversationId !== activeConversation.id && (
                     <button
                       type="button"
                       className="conversation-header-delete"
                       title="Delete conversation"
-                      onClick={() => void openDeleteConversationModal(detail.conversation)}
+                      onClick={() => void openDeleteConversationModal(activeConversation)}
                     >
                       <Trash2 size={18} />
                     </button>
@@ -3204,6 +3337,40 @@ export default function App() {
 
       <aside className={`conversation-pane ${conversationPaneCollapsed ? "conversation-pane-is-collapsed" : ""}`}>
         <div className="conversation-pane-toolbar">
+          {!conversationPaneCollapsed && (
+            <div className="conversation-sort-controls" role="group" aria-label="Sort discussions">
+              <button
+                type="button"
+                className={`conversation-sort-button ${conversationSortMode === "custom" ? "conversation-sort-active" : ""}`}
+                title="Custom order (drag to reorder)"
+                aria-label="Custom order"
+                aria-pressed={conversationSortMode === "custom"}
+                onClick={() => changeConversationSortMode("custom")}
+              >
+                <GripVertical size={16} />
+              </button>
+              <button
+                type="button"
+                className={`conversation-sort-button ${conversationSortMode === "recent" ? "conversation-sort-active" : ""}`}
+                title="Most recent activity first"
+                aria-label="Most recent activity first"
+                aria-pressed={conversationSortMode === "recent"}
+                onClick={() => changeConversationSortMode("recent")}
+              >
+                <Clock size={16} />
+              </button>
+              <button
+                type="button"
+                className={`conversation-sort-button ${conversationSortMode === "alphabetical" ? "conversation-sort-active" : ""}`}
+                title="Alphabetical by title"
+                aria-label="Alphabetical by title"
+                aria-pressed={conversationSortMode === "alphabetical"}
+                onClick={() => changeConversationSortMode("alphabetical")}
+              >
+                <ArrowDownAZ size={16} />
+              </button>
+            </div>
+          )}
           <button
             type="button"
             className="conversation-pane-toggle"
@@ -3217,13 +3384,13 @@ export default function App() {
 
         {!conversationPaneCollapsed && (
         <div className="conversation-list">
-          {conversations.map((conversation) => (
+          {displayedConversations.map((conversation) => (
             <div
               key={conversation.id}
-              className={`conversation-item ${conversation.id === activeId ? "conversation-active" : ""} ${
-                conversation.id === dragOverConversationId ? "conversation-drag-over" : ""
-              }`}
-              draggable={editingConversationId !== conversation.id}
+              className={`conversation-item ${conversationSortMode === "custom" ? "conversation-item-draggable" : ""} ${
+                conversation.id === activeId ? "conversation-active" : ""
+              } ${conversation.id === dragOverConversationId ? "conversation-drag-over" : ""}`}
+              draggable={conversationSortMode === "custom" && editingConversationId !== conversation.id}
               onDragStart={(event) => {
                 setDraggedConversationId(conversation.id);
                 event.dataTransfer.effectAllowed = "move";
@@ -3255,7 +3422,7 @@ export default function App() {
                     autoFocus
                     value={editingConversationTitle}
                     onChange={(event) => setEditingConversationTitle(event.target.value)}
-                    onBlur={() => void saveConversationTitle(conversation)}
+                    onBlur={(event) => void saveConversationTitle(conversation, event.currentTarget.value)}
                     onFocus={(event) => event.currentTarget.select()}
                     onKeyDown={(event) => handleConversationTitleKeyDown(event, conversation)}
                     aria-label="Discussion title"
@@ -3263,6 +3430,7 @@ export default function App() {
                   <span>{formatDate(conversation.updated_at)}</span>
                 </div>
               ) : (
+                <div className="conversation-item-main">
                 <button
                   type="button"
                   className="conversation-select"
@@ -3282,7 +3450,7 @@ export default function App() {
                     {conversation.title}
                   </strong>
                   <span className="conversation-select-meta">
-                    {generationJobs[conversation.id] && (
+                    {generationJobs[conversation.id] ? (
                       <span
                         className="conversation-generating-pill"
                         title="Generating reply — click to view progress"
@@ -3294,10 +3462,29 @@ export default function App() {
                         <Loader2 size={13} className="spin" />
                         Generating
                       </span>
-                    )}
+                    ) : unreviewedReplyConversationIds.includes(conversation.id) ? (
+                      <span className="conversation-unreviewed-pill" title="Reply ready — open to review">
+                        <Bell size={13} />
+                        Ready
+                      </span>
+                    ) : null}
                     <span>{formatDate(conversation.updated_at)}</span>
                   </span>
                 </button>
+                <button
+                  type="button"
+                  className="conversation-rename-button"
+                  title="Rename discussion"
+                  aria-label="Rename discussion"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    startEditingConversationTitle(conversation);
+                  }}
+                >
+                  <Pencil size={14} />
+                </button>
+                </div>
               )}
             </div>
           ))}
@@ -3612,8 +3799,14 @@ export default function App() {
       )}
 
       {progressModalJob && (
-        <div className="llm-progress-backdrop" role="status" aria-live="polite" aria-label="LLM generation in progress">
-          <div className="llm-progress-card">
+        <div
+          className="llm-progress-backdrop"
+          role="status"
+          aria-live="polite"
+          aria-label="LLM generation in progress"
+          onMouseDown={dismissProgressModal}
+        >
+          <div className="llm-progress-card" onMouseDown={(event) => event.stopPropagation()}>
             <div className="llm-progress-header">
               <div className="llm-progress-icon">
                 <Brain size={36} />
@@ -3758,7 +3951,7 @@ export default function App() {
           role="dialog"
           aria-modal="true"
           aria-labelledby="generation-complete-title"
-          onMouseDown={() => setCompletedGenerationAlert(null)}
+          onMouseDown={dismissCompletedGenerationAlert}
         >
           <div className="modal-card generation-complete-modal" onMouseDown={(event) => event.stopPropagation()}>
             <div className={`generation-complete-icon ${completedGenerationAlert.error ? "generation-complete-icon-error" : ""}`}>
@@ -3774,7 +3967,7 @@ export default function App() {
                 : "The assistant finished generating a reply while you were in another conversation."}
             </p>
             <div className="modal-actions">
-              <button type="button" className="secondary-button" onClick={() => setCompletedGenerationAlert(null)}>
+              <button type="button" className="secondary-button" onClick={dismissCompletedGenerationAlert}>
                 Dismiss
               </button>
               <button type="button" onClick={() => void goToCompletedAnswer()}>
