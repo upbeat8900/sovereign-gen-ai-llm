@@ -1,12 +1,14 @@
 import base64
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Union
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from .database import (
@@ -33,8 +35,10 @@ from .multi_agent import (
     participant_display_name,
     previous_discussion_speaker,
     build_discussion_response_instruction,
+    build_participant_character_instruction,
 )
-from .stt import WHISPER_MODEL_OPTIONS, set_whisper_model, transcribe_audio_bytes
+from .stt import WHISPER_MODEL_OPTIONS, get_whisper_model, set_whisper_model, transcribe_audio_bytes
+from .tts import list_elevenlabs_voices, synthesize_elevenlabs_speech
 from .models import (
     AgentProfileCreate,
     AgentProfileRead,
@@ -49,6 +53,8 @@ from .models import (
     ConversationReorder,
     ConversationTitleUpdate,
     CrossConversationMemoryMerge,
+    ElevenLabsSynthesizeRequest,
+    ElevenLabsVoiceRead,
     LlmContextPreview,
     LlmConfigRead,
     LlmConfigUpdate,
@@ -89,6 +95,7 @@ def startup() -> None:
         row = connection.execute("SELECT whisper_model FROM speech_config WHERE id = 1").fetchone()
         if row:
             set_whisper_model(row["whisper_model"])
+    threading.Thread(target=get_whisper_model, name="whisper-warmup", daemon=True).start()
 
 
 def _conversation_or_404(connection, conversation_id: int) -> dict:
@@ -699,21 +706,28 @@ def _build_llm_messages(
     included_all_memories = _memories_excluding_history_duplicates(all_memories, history_rows)
 
     prompt_config = _prompt_config_or_default(connection)
-    messages = [
-        {
-            "role": "system",
-            "content": prompt_config["default_prompt"],
-        }
-    ]
-    length_priority = _answer_length_priority_message(answer_length)
-    if length_priority:
-        messages.append({"role": "system", "content": length_priority})
-    personality = (participant.get("personality") or "").strip() if participant else ""
-    if personality:
+    messages = []
+    if not participant:
         messages.append(
             {
                 "role": "system",
-                "content": f"Your perspective and role:\n{personality}",
+                "content": prompt_config["default_prompt"],
+            }
+        )
+    length_priority = _answer_length_priority_message(answer_length)
+    if length_priority:
+        messages.append({"role": "system", "content": length_priority})
+
+    participants_by_id = {}
+    all_participants = []
+    if participant:
+        all_participants = load_participants(connection, conversation_id)
+        for item in all_participants:
+            participants_by_id[item["id"]] = item
+        messages.append(
+            {
+                "role": "system",
+                "content": build_participant_character_instruction(participant, all_participants),
             }
         )
     if included_memories:
@@ -722,13 +736,6 @@ def _build_llm_messages(
     if included_all_memories:
         all_memory_text = "\n".join(f"- {memory['content']}" for memory in included_all_memories)
         messages.append({"role": "user", "content": f"User memories:\n{all_memory_text}"})
-
-    participants_by_id = {}
-    all_participants = []
-    if participant:
-        all_participants = load_participants(connection, conversation_id)
-        for item in all_participants:
-            participants_by_id[item["id"]] = item
 
     for row in history_rows:
         speaker_label = None
@@ -751,6 +758,18 @@ def _build_llm_messages(
                     participant,
                     all_participants,
                     previous_speaker_label,
+                ),
+            }
+        )
+
+    if participant:
+        current_name = participant_display_name(participant)
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f'Before you reply: write only what "{current_name}" would say — '
+                    "first person, in character, from their point of view. No other voices."
                 ),
             }
         )
@@ -1100,40 +1119,86 @@ def _speech_config_or_default(connection) -> dict:
     return row
 
 
+def _public_speech_config(config: dict) -> dict:
+    api_key = (config.get("elevenlabs_api_key") or "").strip() or None
+    return {
+        "whisper_model": config["whisper_model"],
+        "whisper_model_options": WHISPER_MODEL_OPTIONS,
+        "has_elevenlabs_api_key": bool(api_key),
+        "elevenlabs_api_key_preview": _mask_api_key(api_key),
+        "updated_at": config["updated_at"],
+    }
+
+
+def _elevenlabs_api_key_or_400(connection) -> str:
+    config = _speech_config_or_default(connection)
+    api_key = (config.get("elevenlabs_api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="ElevenLabs API key is not configured")
+    return api_key
+
+
 @app.get("/api/config/speech", response_model=SpeechConfigRead)
 def get_speech_config() -> dict:
     with get_connection() as connection:
         config = _speech_config_or_default(connection)
-        return {
-            "whisper_model": config["whisper_model"],
-            "whisper_model_options": WHISPER_MODEL_OPTIONS,
-            "updated_at": config["updated_at"],
-        }
+        return _public_speech_config(config)
 
 
 @app.put("/api/config/speech", response_model=SpeechConfigRead)
 def update_speech_config(payload: SpeechConfigUpdate) -> dict:
-    model_name = payload.whisper_model.strip()
-    if model_name not in WHISPER_MODEL_OPTIONS:
-        raise HTTPException(status_code=400, detail="Unsupported Whisper model")
-
     with get_connection() as connection:
-        _speech_config_or_default(connection)
+        current = _speech_config_or_default(connection)
+        model_name = current["whisper_model"]
+        if payload.whisper_model is not None:
+            model_name = payload.whisper_model.strip()
+            if model_name not in WHISPER_MODEL_OPTIONS:
+                raise HTTPException(status_code=400, detail="Unsupported Whisper model")
+
+        if payload.clear_elevenlabs_api_key:
+            api_key = None
+        elif payload.elevenlabs_api_key is not None:
+            api_key = payload.elevenlabs_api_key.strip() or None
+        else:
+            api_key = (current.get("elevenlabs_api_key") or "").strip() or None
+
         connection.execute(
             """
             UPDATE speech_config
-            SET whisper_model = ?, updated_at = CURRENT_TIMESTAMP
+            SET whisper_model = ?, elevenlabs_api_key = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = 1
             """,
-            (model_name,),
+            (model_name, api_key),
         )
         set_whisper_model(model_name)
         config = row_to_dict(connection.execute("SELECT * FROM speech_config WHERE id = 1").fetchone())
-        return {
-            "whisper_model": config["whisper_model"],
-            "whisper_model_options": WHISPER_MODEL_OPTIONS,
-            "updated_at": config["updated_at"],
-        }
+        return _public_speech_config(config)
+
+
+@app.get("/api/tts/elevenlabs/voices", response_model=List[ElevenLabsVoiceRead])
+def get_elevenlabs_voices() -> List[dict]:
+    with get_connection() as connection:
+        api_key = _elevenlabs_api_key_or_400(connection)
+    try:
+        return list_elevenlabs_voices(api_key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/tts/elevenlabs/synthesize")
+def synthesize_elevenlabs_audio(payload: ElevenLabsSynthesizeRequest) -> Response:
+    with get_connection() as connection:
+        api_key = _elevenlabs_api_key_or_400(connection)
+    try:
+        audio = synthesize_elevenlabs_speech(
+            api_key=api_key,
+            voice_id=payload.voice_id.strip(),
+            text=payload.text,
+            speech_rate=payload.speech_rate,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 @app.get("/api/conversations", response_model=List[Conversation])
@@ -1298,11 +1363,18 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
         participants = load_participants(connection, conversation_id)
         multi_agent_note = None
         if participants:
-            config = _llm_model_or_404(connection, participants[0]["llm_model_id"])
-            multi_agent_note = (
-                f"Multi-agent preview for first participant ({config['model']}). "
-                "Other participants use the same shared context with different models and personalities."
-            )
+            preview_model_id = payload.override_llm_model_id or participants[0]["llm_model_id"]
+            config = _llm_model_or_404(connection, preview_model_id)
+            if payload.override_llm_model_id:
+                multi_agent_note = (
+                    f"Multi-agent preview using composer model override ({config['model']}). "
+                    "All agents use this model until the override is cleared."
+                )
+            else:
+                multi_agent_note = (
+                    f"Multi-agent preview for first participant ({config['model']}). "
+                    "Other participants use the same shared context with different models and personalities."
+                )
         else:
             config = _conversation_llm_model(connection, conversation)
         llm_messages, included_memory_count, included_all_memory_count = _build_llm_messages(
@@ -1376,6 +1448,8 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
 
         participants = load_participants(connection, conversation_id)
         if participants:
+            if payload.override_llm_model_id is not None:
+                _llm_model_or_404(connection, payload.override_llm_model_id)
             discussion_rounds = clamp_discussion_rounds(payload.discussion_rounds)
             assistant_messages = run_multi_agent_turns(
                 connection,
@@ -1386,6 +1460,7 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
                 include_memories=payload.include_memories,
                 include_all_memories=payload.include_all_memories,
                 answer_length=payload.answer_length,
+                override_llm_model_id=payload.override_llm_model_id,
                 build_llm_messages=_build_llm_messages,
                 insert_message=_insert_message,
                 update_generation_stats=_update_generation_stats,

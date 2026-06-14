@@ -169,6 +169,7 @@ class MessageCreate(BaseModel):
     include_all_memories: bool = False
     discussion_rounds: int = 1
     answer_length: int = 3
+    override_llm_model_id: Optional[int] = None
 
     @field_validator("answer_length")
     @classmethod
@@ -281,11 +282,30 @@ class LlmConfigUpdate(BaseModel):
 class SpeechConfigRead(BaseModel):
     whisper_model: str
     whisper_model_options: List[str]
+    has_elevenlabs_api_key: bool
+    elevenlabs_api_key_preview: Optional[str] = None
     updated_at: str
 
 
 class SpeechConfigUpdate(BaseModel):
-    whisper_model: str = Field(min_length=1)
+    whisper_model: Optional[str] = None
+    elevenlabs_api_key: Optional[str] = None
+    clear_elevenlabs_api_key: bool = False
+
+
+class ElevenLabsVoiceRead(BaseModel):
+    voice_id: str
+    name: str
+    gender: Optional[str] = None
+    age: Optional[str] = None
+    characteristics: Optional[str] = None
+    label: str
+
+
+class ElevenLabsSynthesizeRequest(BaseModel):
+    text: str = Field(min_length=1)
+    voice_id: str = Field(min_length=1)
+    speech_rate: Optional[float] = None
 
 
 class PromptConfigRead(BaseModel):

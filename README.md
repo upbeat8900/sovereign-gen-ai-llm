@@ -23,7 +23,7 @@ Commercial chat products decide what to remember, what to forget, and how the as
 - **Editable system prompt** (Settings → Default prompt)
 - **Multiple LLM profiles** — Ollama, OpenAI, or OpenAI-compatible APIs; pick a model per conversation
 - **Speech-to-text** via local Whisper (faster-whisper)
-- **Browser text-to-speech** for reading replies aloud
+- **Text-to-speech** via browser voices or ElevenLabs (Settings → Speech; API key unlocks custom/cloned voices)
 - **Context preview** — inspect system prompt, memories, and history token estimates before sending
 - **Docker** one-command deploy, or run backend + frontend in development mode
 

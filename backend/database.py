@@ -181,6 +181,7 @@ def init_db() -> None:
         _ensure_column(connection, "memories", "archived_at", "TEXT")
         _ensure_column(connection, "llm_models", "comments", "TEXT")
         _ensure_column(connection, "llm_models", "tts_voice_uri", "TEXT")
+        _ensure_column(connection, "speech_config", "elevenlabs_api_key", "TEXT")
         _backfill_memory_titles(connection)
         _ensure_column(connection, "memories", "title_generated_at", "TEXT")
         _backfill_memory_title_generated_at(connection)

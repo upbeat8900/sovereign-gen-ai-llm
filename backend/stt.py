@@ -52,7 +52,15 @@ def transcribe_audio_bytes(data: bytes, filename: str = "audio.webm") -> str:
             tmp.write(data)
             path = tmp.name
         model = get_whisper_model()
-        segments, _ = model.transcribe(path, beam_size=1, vad_filter=True)
+        transcribe_kwargs: dict = {
+            "beam_size": 1,
+            "vad_filter": True,
+            "condition_on_previous_text": False,
+        }
+        model_name = _model_name or os.getenv("WHISPER_MODEL", "base.en")
+        if model_name.endswith(".en"):
+            transcribe_kwargs["language"] = "en"
+        segments, _ = model.transcribe(path, **transcribe_kwargs)
         return "".join(segment.text for segment in segments).strip()
     finally:
         if path:

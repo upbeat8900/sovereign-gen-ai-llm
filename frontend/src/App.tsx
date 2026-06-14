@@ -5,9 +5,11 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
+  Download,
   ArrowDown,
   ArrowDownAZ,
   ArrowUp,
+  ArrowUpDown,
   Bell,
   Bot,
   ChevronLeft,
@@ -170,6 +172,8 @@ type LlmConfig = {
 type SpeechConfig = {
   whisper_model: string;
   whisper_model_options: string[];
+  has_elevenlabs_api_key: boolean;
+  elevenlabs_api_key_preview?: string | null;
   updated_at: string;
 };
 
@@ -183,6 +187,65 @@ type TtsVoiceOption = {
   uri: string;
   label: string;
 };
+
+type ElevenLabsVoice = {
+  voice_id: string;
+  name: string;
+  gender?: string | null;
+  age?: string | null;
+  characteristics?: string | null;
+  label: string;
+};
+
+type ElevenLabsVoiceFilters = {
+  name: string;
+  gender: string;
+  age: string;
+  characteristics: string;
+};
+
+const EMPTY_ELEVENLABS_VOICE_FILTERS: ElevenLabsVoiceFilters = {
+  name: "",
+  gender: "",
+  age: "",
+  characteristics: "",
+};
+
+type ElevenLabsVoiceSortKey = keyof ElevenLabsVoiceFilters;
+
+type ElevenLabsVoiceSort = {
+  key: ElevenLabsVoiceSortKey;
+  direction: "asc" | "desc";
+};
+
+function sortElevenLabsVoices(
+  voices: ElevenLabsVoice[],
+  sort: ElevenLabsVoiceSort | null,
+): ElevenLabsVoice[] {
+  if (!sort) return voices;
+  const factor = sort.direction === "asc" ? 1 : -1;
+  return [...voices].sort((left, right) => {
+    const leftValue = (left[sort.key] ?? "").trim().toLowerCase();
+    const rightValue = (right[sort.key] ?? "").trim().toLowerCase();
+    return leftValue.localeCompare(rightValue) * factor;
+  });
+}
+
+function matchesElevenLabsVoiceFilter(value: string | null | undefined, filter: string): boolean {
+  const query = filter.trim().toLowerCase();
+  if (!query) return true;
+  return (value ?? "").toLowerCase().includes(query);
+}
+
+function filterElevenLabsVoices(voices: ElevenLabsVoice[], filters: ElevenLabsVoiceFilters): ElevenLabsVoice[] {
+  return voices.filter(
+    (voice) =>
+      matchesElevenLabsVoiceFilter(voice.name, filters.name) &&
+      matchesElevenLabsVoiceFilter(voice.gender, filters.gender) &&
+      matchesElevenLabsVoiceFilter(voice.age, filters.age) &&
+      matchesElevenLabsVoiceFilter(voice.characteristics, filters.characteristics),
+  );
+}
 
 type SelectedClip = {
   content: string;
@@ -204,6 +267,8 @@ type MemoryExport = {
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
+const ELEVENLABS_VOICE_PREFIX = "elevenlabs:";
+const ELEVENLABS_CATALOG_STORAGE_KEY = "elevenlabs_voice_catalog";
 const TTS_VOICE_STORAGE_KEY = "tts_voice_uri";
 const TTS_RATE_STORAGE_KEY = "tts_speech_rate";
 const CURRENT_MESSAGE_ONLY_STORAGE_KEY = "chat_current_message_only";
@@ -212,6 +277,7 @@ const INCLUDE_MEMORIES_STORAGE_KEY = "chat_include_memories";
 const INCLUDE_ALL_MEMORIES_STORAGE_KEY = "chat_include_all_memories";
 const CONVERSATION_SORT_STORAGE_KEY = "chat_conversation_sort";
 const DISCUSSION_ROUNDS_STORAGE_KEY = "chat_discussion_rounds";
+const MULTI_AGENT_MODEL_OVERRIDE_KEY = "chat_multi_agent_model_override";
 const ANSWER_LENGTH_STORAGE_KEY = "chat_answer_length";
 const ANSWER_LENGTH_MIN = 1;
 const ANSWER_LENGTH_MAX = 5;
@@ -387,6 +453,7 @@ function historyLimitTitle(total: number, min: number, max: number) {
 const TTS_RATE_MIN = 0.5;
 const TTS_RATE_MAX = 2.5;
 const TTS_SAMPLE_TEXT = "Hello, this is a sample of how the assistant will sound when reading replies.";
+const TRANSCRIBING_PLACEHOLDER = "Transcribing…";
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const CONVERSATION_PANE_WIDTH = 330;
@@ -572,6 +639,74 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function isElevenLabsVoiceUri(uri?: string | null): boolean {
+  return Boolean(uri?.startsWith(ELEVENLABS_VOICE_PREFIX));
+}
+
+function parseElevenLabsVoiceId(uri: string): string {
+  return uri.slice(ELEVENLABS_VOICE_PREFIX.length);
+}
+
+function toElevenLabsVoiceUri(voiceId: string): string {
+  return `${ELEVENLABS_VOICE_PREFIX}${voiceId}`;
+}
+
+function elevenlabsVoicesToOptions(voices: ElevenLabsVoice[]): TtsVoiceOption[] {
+  return voices.map((voice) => ({
+    uri: toElevenLabsVoiceUri(voice.voice_id),
+    label: voice.label,
+  }));
+}
+
+function mergeTtsVoiceOptions(browserOptions: TtsVoiceOption[], elevenLabsVoices: ElevenLabsVoice[]): TtsVoiceOption[] {
+  return [...browserOptions, ...elevenlabsVoicesToOptions(elevenLabsVoices)];
+}
+
+function readStoredElevenlabsCatalog(): ElevenLabsVoice[] {
+  try {
+    const raw = localStorage.getItem(ELEVENLABS_CATALOG_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (voice): voice is ElevenLabsVoice =>
+        Boolean(voice) &&
+        typeof voice === "object" &&
+        typeof (voice as ElevenLabsVoice).voice_id === "string" &&
+        typeof (voice as ElevenLabsVoice).name === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistElevenlabsCatalog(voices: ElevenLabsVoice[]) {
+  localStorage.setItem(ELEVENLABS_CATALOG_STORAGE_KEY, JSON.stringify(voices));
+}
+
+function clearStoredElevenlabsCatalog() {
+  localStorage.removeItem(ELEVENLABS_CATALOG_STORAGE_KEY);
+}
+
+async function requestElevenLabsAudio(text: string, voiceId: string, speechRate?: number): Promise<Blob> {
+  const response = await fetch(`${API_BASE}/api/tts/elevenlabs/synthesize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text,
+      voice_id: voiceId,
+      speech_rate: speechRate,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail ?? `Synthesis failed: ${response.status}`);
+  }
+
+  return response.blob();
+}
+
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
 }
@@ -604,6 +739,14 @@ function stripMarkdownForSpeech(value: string) {
     .trim();
 }
 
+function stripSpeakerPrefixForSpeech(value: string) {
+  return value.replace(/^\[[^\]]+\]:\s*/i, "").trim();
+}
+
+function prepareAssistantTextForSpeech(value: string) {
+  return stripSpeakerPrefixForSpeech(stripMarkdownForSpeech(value));
+}
+
 function getSelectedTextInMessage(messageId: number) {
   const selection = window.getSelection();
   if (!selection || selection.rangeCount === 0) return null;
@@ -625,6 +768,10 @@ function getSelectedTextInMessage(messageId: number) {
 
 function createOptimisticTimestamp() {
   return new Date().toISOString().slice(0, 19);
+}
+
+function persistedMessageCount(messages: Message[] | undefined) {
+  return messages?.filter((message) => message.id >= 0).length ?? 0;
 }
 
 function sortTtsVoices(voices: SpeechSynthesisVoice[]) {
@@ -671,18 +818,38 @@ function clampTtsSpeechRate(rate: number): number {
   return Math.min(TTS_RATE_MAX, Math.max(TTS_RATE_MIN, rate));
 }
 
-function resolveTtsSpeechRateForParticipant(participant: ConversationParticipant | ParticipantDraft): number {
+function resolveAgentProfileForParticipant(
+  participant: ConversationParticipant | ParticipantDraft,
+  agentProfiles: AgentProfile[],
+): AgentProfile | undefined {
+  const profileId = participant.agent_profile_id;
+  if (profileId == null) return undefined;
+  return agentProfiles.find((profile) => profile.id === profileId);
+}
+
+function resolveTtsSpeechRateForParticipant(
+  participant: ConversationParticipant | ParticipantDraft,
+  agentProfiles: AgentProfile[] = [],
+): number {
   if (participant.tts_speech_rate != null && Number.isFinite(participant.tts_speech_rate)) {
     return clampTtsSpeechRate(participant.tts_speech_rate);
+  }
+  const profile = resolveAgentProfileForParticipant(participant, agentProfiles);
+  if (profile?.tts_speech_rate != null && Number.isFinite(profile.tts_speech_rate)) {
+    return clampTtsSpeechRate(profile.tts_speech_rate);
   }
   return readStoredTtsSpeechRate();
 }
 
-function resolveTtsSpeechRateForMessage(message: Message, participants: ConversationParticipant[]): number {
+function resolveTtsSpeechRateForMessage(
+  message: Message,
+  participants: ConversationParticipant[],
+  agentProfiles: AgentProfile[] = [],
+): number {
   if (message.participant_id != null) {
     const participant = participants.find((item) => item.id === message.participant_id);
     if (participant) {
-      return resolveTtsSpeechRateForParticipant(participant);
+      return resolveTtsSpeechRateForParticipant(participant, agentProfiles);
     }
   }
   return readStoredTtsSpeechRate();
@@ -750,6 +917,51 @@ function readStoredAnswerLength(): number {
 
 function answerLengthLabel(level: number) {
   return ANSWER_LENGTH_LABELS[Math.max(0, Math.min(ANSWER_LENGTH_LABELS.length - 1, level - 1))];
+}
+
+function multiAgentModelOverrideStorageKey(conversationId: number) {
+  return `${MULTI_AGENT_MODEL_OVERRIDE_KEY}_${conversationId}`;
+}
+
+function readStoredMultiAgentModelOverride(conversationId: number): number | null {
+  const stored = localStorage.getItem(multiAgentModelOverrideStorageKey(conversationId));
+  if (stored === null || stored === "") return null;
+  const parsed = Number(stored);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
+}
+
+function assistantMessageHasVisibleContent(message: Message) {
+  return Boolean(message.content?.trim());
+}
+
+function filterVisibleChatMessages(
+  messages: Message[],
+  options: {
+    isMultiAgent: boolean;
+    isGenerating: boolean;
+    allowSinglePlaceholder: boolean;
+  },
+) {
+  let keptSinglePlaceholder = false;
+  return messages.filter((message) => {
+    if (message.role !== "assistant") {
+      return true;
+    }
+    if (assistantMessageHasVisibleContent(message)) {
+      return true;
+    }
+    if (options.isMultiAgent) {
+      return false;
+    }
+    if (!options.isGenerating || !options.allowSinglePlaceholder || message.id >= 0) {
+      return false;
+    }
+    if (keptSinglePlaceholder) {
+      return false;
+    }
+    keptSinglePlaceholder = true;
+    return true;
+  });
 }
 
 function createParticipantDraft(models: LlmModel[], index = 0): ParticipantDraft {
@@ -861,12 +1073,14 @@ function AgentProfileFields({
   draft,
   onChange,
   models,
+  agentProfiles,
   ttsVoiceOptions,
   onPlayVoiceSample,
 }: {
   draft: ParticipantDraft;
   onChange: (patch: Partial<ParticipantDraft>) => void;
   models: LlmModel[];
+  agentProfiles: AgentProfile[];
   ttsVoiceOptions: TtsVoiceOption[];
   onPlayVoiceSample: (voiceUri?: string, speechRate?: number) => void;
 }) {
@@ -912,7 +1126,9 @@ function AgentProfileFields({
         <button
           type="button"
           className="speech-sample-button"
-          onClick={() => onPlayVoiceSample(draft.tts_voice_uri, resolveTtsSpeechRateForParticipant(draft))}
+          onClick={() =>
+            onPlayVoiceSample(draft.tts_voice_uri, resolveTtsSpeechRateForParticipant(draft, agentProfiles))
+          }
           disabled={!ttsVoiceOptions.length}
         >
           <Play size={16} />
@@ -986,10 +1202,13 @@ function ParticipantEditor({
   onPlayVoiceSample: (voiceUri?: string, speechRate?: number) => void;
   savingProfileIndex?: number | null;
 }) {
-  const [expandedIndex, setExpandedIndex] = useState(0);
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(0);
 
   useEffect(() => {
-    setExpandedIndex((current) => Math.min(current, Math.max(0, participants.length - 1)));
+    setExpandedIndex((current) => {
+      if (current == null) return current;
+      return Math.min(current, Math.max(0, participants.length - 1));
+    });
   }, [participants.length]);
 
   function updateParticipant(index: number, patch: Partial<ParticipantDraft>) {
@@ -1018,14 +1237,15 @@ function ParticipantEditor({
     if (participants.length <= 1) return;
     onChange(participants.filter((_, i) => i !== index));
     setExpandedIndex((current) => {
+      if (current == null) return current;
       if (current === index) return Math.max(0, index - 1);
       if (current > index) return current - 1;
       return current;
     });
   }
 
-  function selectParticipant(index: number) {
-    setExpandedIndex(index);
+  function toggleParticipant(index: number) {
+    setExpandedIndex((current) => (current === index ? null : index));
   }
 
   return (
@@ -1046,17 +1266,17 @@ function ParticipantEditor({
                   type="button"
                   className="participant-editor-toggle"
                   aria-expanded={isExpanded}
-                  onClick={() => selectParticipant(index)}
+                  onClick={() => toggleParticipant(index)}
                 >
                   <ChevronRight size={18} className="participant-editor-chevron" />
                   <span className="participant-editor-toggle-text">
                     <strong>{displayName}</strong>
-                    {!isExpanded && (
-                      <span className="participant-editor-summary">
-                        {modelLabel}
-                        {personalityPreview ? ` · ${personalityPreview.slice(0, 48)}${personalityPreview.length > 48 ? "…" : ""}` : ""}
-                      </span>
-                    )}
+                    <span className="participant-editor-summary">
+                      {modelLabel}
+                      {personalityPreview
+                        ? ` · ${personalityPreview.slice(0, 48)}${personalityPreview.length > 48 ? "…" : ""}`
+                        : ""}
+                    </span>
                   </span>
                 </button>
                 {participants.length > 1 && (
@@ -1092,6 +1312,7 @@ function ParticipantEditor({
                     draft={participant}
                     onChange={(patch) => updateParticipant(index, patch)}
                     models={models}
+                    agentProfiles={agentProfiles}
                     ttsVoiceOptions={ttsVoiceOptions}
                     onPlayVoiceSample={onPlayVoiceSample}
                   />
@@ -1180,6 +1401,7 @@ export default function App() {
   const [savingAgentProfileEdit, setSavingAgentProfileEdit] = useState(false);
   const [participantEditorTarget, setParticipantEditorTarget] = useState<"new" | "edit">("new");
   const [discussionRounds, setDiscussionRounds] = useState(readStoredDiscussionRounds);
+  const [multiAgentModelOverrideId, setMultiAgentModelOverrideId] = useState<number | null>(null);
   const [answerLength, setAnswerLength] = useState(readStoredAnswerLength);
   const [deleteConversationTarget, setDeleteConversationTarget] = useState<Conversation | null>(null);
   const [deleteMessageCount, setDeleteMessageCount] = useState(0);
@@ -1218,6 +1440,14 @@ export default function App() {
   const [resettingTimingModelId, setResettingTimingModelId] = useState<number | null>(null);
   const [speechConfig, setSpeechConfig] = useState<SpeechConfig | null>(null);
   const [whisperModelDraft, setWhisperModelDraft] = useState("base.en");
+  const [elevenlabsApiKeyDraft, setElevenlabsApiKeyDraft] = useState("");
+  const [clearElevenlabsApiKeyDraft, setClearElevenlabsApiKeyDraft] = useState(false);
+  const [elevenlabsCatalogVoices, setElevenlabsCatalogVoices] = useState<ElevenLabsVoice[]>(readStoredElevenlabsCatalog);
+  const [elevenlabsVoiceFilters, setElevenlabsVoiceFilters] = useState<ElevenLabsVoiceFilters>(
+    EMPTY_ELEVENLABS_VOICE_FILTERS,
+  );
+  const [elevenlabsVoiceSort, setElevenlabsVoiceSort] = useState<ElevenLabsVoiceSort | null>(null);
+  const [isImportingElevenlabsVoices, setIsImportingElevenlabsVoices] = useState(false);
   const [promptConfig, setPromptConfig] = useState<PromptConfig | null>(null);
   const [defaultPromptDraft, setDefaultPromptDraft] = useState("");
   const [ttsVoiceOptions, setTtsVoiceOptions] = useState<TtsVoiceOption[]>([]);
@@ -1244,8 +1474,11 @@ export default function App() {
     voiceUri?: string;
     speechRate?: number;
   } | null>(null);
+  const audioPlaybackRef = useRef<HTMLAudioElement | null>(null);
+  const audioBlobUrlRef = useRef<string | null>(null);
   const playbackSessionRef = useRef(0);
   const speechQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const elevenlabsCatalogHydratedRef = useRef(false);
   const spokenMessageIdsByConversationRef = useRef<Record<number, Set<number>>>({});
   const speakRepliesByConversationRef = useRef<Record<number, boolean>>({});
   const speakReplyStartIndexByConversationRef = useRef<Record<number, number>>({});
@@ -1258,6 +1491,14 @@ export default function App() {
   const pendingLatestScrollRef = useRef(false);
 
   const allMemories = useMemo(() => memoryGroups.flatMap((group) => group.memories), [memoryGroups]);
+  const displayedElevenlabsCatalogVoices = useMemo(() => {
+    const filtered = filterElevenLabsVoices(elevenlabsCatalogVoices, elevenlabsVoiceFilters);
+    return sortElevenLabsVoices(filtered, elevenlabsVoiceSort);
+  }, [elevenlabsCatalogVoices, elevenlabsVoiceFilters, elevenlabsVoiceSort]);
+  const hasActiveElevenlabsVoiceFilters = useMemo(
+    () => Object.values(elevenlabsVoiceFilters).some((value) => value.trim()),
+    [elevenlabsVoiceFilters],
+  );
   const otherConversationMemories = useMemo(
     () => allMemories.filter((memory) => memory.conversation_id !== activeId),
     [allMemories, activeId],
@@ -1355,6 +1596,10 @@ export default function App() {
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
   const activeParticipants = detail?.participants ?? [];
   const isMultiAgentConversation = activeParticipants.length > 0;
+  const multiAgentOverrideModel = useMemo(() => {
+    if (multiAgentModelOverrideId == null) return null;
+    return config?.models.find((model) => model.id === multiAgentModelOverrideId) ?? null;
+  }, [config?.models, multiAgentModelOverrideId]);
   const activeConversationGenerating = activeId != null && activeId in generationJobs;
   const progressModalJob =
     progressModalConversationId != null ? generationJobs[progressModalConversationId] ?? null : null;
@@ -1363,24 +1608,34 @@ export default function App() {
     : 0;
   const chatMessages = useMemo(() => {
     const base = detail?.messages ?? [];
-    if (!activeId || !generationJobs[activeId]) return base;
-    const last = base[base.length - 1];
-    if (last?.role === "assistant" && !last.content && last.id < 0) return base;
-    if (last?.role === "user") {
-      return [
-        ...base,
-        {
-          id: -generationJobs[activeId].startedAt,
-          conversation_id: activeId,
-          role: "assistant" as const,
-          content: "",
-          llm_model: generationJobs[activeId].modelName,
-          created_at: new Date().toISOString(),
-        },
-      ];
+    const job = activeId != null ? generationJobs[activeId] : undefined;
+    let messages = base;
+
+    if (job && activeId && !job.isMultiAgent) {
+      const last = messages[messages.length - 1];
+      const hasPendingPlaceholder =
+        last?.role === "assistant" && !last.content && last.id < 0;
+      if (last?.role === "user" && !hasPendingPlaceholder) {
+        messages = [
+          ...base,
+          {
+            id: -job.startedAt,
+            conversation_id: activeId,
+            role: "assistant" as const,
+            content: "",
+            llm_model: job.modelName,
+            created_at: new Date().toISOString(),
+          },
+        ];
+      }
     }
-    return base;
-  }, [detail?.messages, activeId, generationJobs]);
+
+    return filterVisibleChatMessages(messages, {
+      isMultiAgent: isMultiAgentConversation,
+      isGenerating: Boolean(job),
+      allowSinglePlaceholder: Boolean(job && !job.isMultiAgent),
+    });
+  }, [detail?.messages, activeId, generationJobs, isMultiAgentConversation]);
   const historyContextOverhead = llmContextOverhead(
     detail?.memories.length ?? 0,
     includeMemories,
@@ -1435,11 +1690,42 @@ export default function App() {
     localStorage.setItem(ANSWER_LENGTH_STORAGE_KEY, String(clamped));
   }
 
+  function updateMultiAgentModelOverride(modelId: number | null) {
+    if (activeId == null) {
+      setMultiAgentModelOverrideId(modelId);
+      return;
+    }
+    setMultiAgentModelOverrideId(modelId);
+    const key = multiAgentModelOverrideStorageKey(activeId);
+    if (modelId == null) {
+      localStorage.removeItem(key);
+      return;
+    }
+    localStorage.setItem(key, String(modelId));
+  }
+
+  useEffect(() => {
+    if (activeId == null || !isMultiAgentConversation) {
+      setMultiAgentModelOverrideId(null);
+      return;
+    }
+    const stored = readStoredMultiAgentModelOverride(activeId);
+    if (stored != null && config?.models.some((model) => model.id === stored)) {
+      setMultiAgentModelOverrideId(stored);
+      return;
+    }
+    if (stored != null) {
+      localStorage.removeItem(multiAgentModelOverrideStorageKey(activeId));
+    }
+    setMultiAgentModelOverrideId(null);
+  }, [activeId, isMultiAgentConversation, config?.models]);
+
   useEffect(() => {
     loadConversations();
     loadMemoryGroups();
     loadConfig();
     void loadAgentProfiles();
+    void loadSpeechConfig({ autoImportVoices: true });
     setTtsSpeechRate(readStoredTtsSpeechRate());
   }, []);
 
@@ -1523,14 +1809,24 @@ export default function App() {
   }, [page]);
 
   useEffect(() => {
-    if (page !== "settings" || !window.speechSynthesis) return;
+    let cancelled = false;
 
     function syncVoices() {
-      const options = buildTtsVoiceOptions(window.speechSynthesis.getVoices());
+      const browserOptions = window.speechSynthesis
+        ? buildTtsVoiceOptions(window.speechSynthesis.getVoices())
+        : [];
+
+      if (cancelled) return;
+
+      const options = mergeTtsVoiceOptions(browserOptions, elevenlabsCatalogVoices);
       setTtsVoiceOptions(options);
       setSelectedTtsVoiceUri((current) => {
         if (current && options.some((option) => option.uri === current)) {
           return current;
+        }
+        const stored = localStorage.getItem(TTS_VOICE_STORAGE_KEY);
+        if (stored && options.some((option) => option.uri === stored)) {
+          return stored;
         }
         const preferred = options[0]?.uri ?? "";
         if (preferred) {
@@ -1540,13 +1836,22 @@ export default function App() {
       });
     }
 
+    function handleVoicesChanged() {
+      syncVoices();
+    }
+
     syncVoices();
     const synth = window.speechSynthesis;
-    synth.onvoiceschanged = syncVoices;
+    if (synth) {
+      synth.onvoiceschanged = handleVoicesChanged;
+    }
     return () => {
-      synth.onvoiceschanged = null;
+      cancelled = true;
+      if (synth) {
+        synth.onvoiceschanged = null;
+      }
     };
-  }, [page]);
+  }, [elevenlabsCatalogVoices]);
 
   useEffect(() => {
     stopSpeechPlayback();
@@ -1648,37 +1953,123 @@ export default function App() {
       }
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
       window.speechSynthesis?.cancel();
+      if (audioPlaybackRef.current) {
+        audioPlaybackRef.current.pause();
+        audioPlaybackRef.current = null;
+      }
+      if (audioBlobUrlRef.current) {
+        URL.revokeObjectURL(audioBlobUrlRef.current);
+        audioBlobUrlRef.current = null;
+      }
       speakingMessageIdRef.current = null;
       speakingPlaybackRef.current = null;
     };
   }, []);
 
+  function revokeAudioBlobUrl() {
+    if (audioBlobUrlRef.current) {
+      URL.revokeObjectURL(audioBlobUrlRef.current);
+      audioBlobUrlRef.current = null;
+    }
+  }
+
+  function stopAudioPlayback() {
+    const audio = audioPlaybackRef.current;
+    if (audio) {
+      audio.pause();
+      audio.onended = null;
+      audio.onerror = null;
+      audio.removeAttribute("src");
+      audio.load();
+      audioPlaybackRef.current = null;
+    }
+    revokeAudioBlobUrl();
+  }
+
+  function playElevenLabsBlob(blob: Blob, session: number, playbackId: number | "sample"): Promise<void> {
+    return new Promise((resolve) => {
+      revokeAudioBlobUrl();
+      const url = URL.createObjectURL(blob);
+      audioBlobUrlRef.current = url;
+      const audio = new Audio(url);
+      audioPlaybackRef.current = audio;
+
+      const finishPlayback = () => {
+        if (playbackSessionRef.current !== session) {
+          resolve();
+          return;
+        }
+        stopAudioPlayback();
+        speakingPlaybackRef.current = null;
+        if (typeof playbackId === "number") {
+          speakingMessageIdRef.current = null;
+          setSpeakingMessageId(null);
+        }
+        resolve();
+      };
+
+      audio.onended = finishPlayback;
+      audio.onerror = finishPlayback;
+      void audio.play().catch(finishPlayback);
+    });
+  }
+
   function stopSpeechPlayback() {
     playbackSessionRef.current += 1;
     speechQueueRef.current = Promise.resolve();
     window.speechSynthesis?.cancel();
+    stopAudioPlayback();
     speakingMessageIdRef.current = null;
     speakingPlaybackRef.current = null;
     setSpeakingMessageId(null);
   }
 
-  function speakTextAsync(content: string, messageId: number, voiceUri?: string, speechRate?: number): Promise<void> {
-    return new Promise((resolve) => {
-      if (!window.speechSynthesis) {
-        resolve();
-        return;
-      }
-      const plain = content.trim();
-      if (!plain) {
-        resolve();
-        return;
-      }
+  async function speakTextAsync(content: string, messageId: number, voiceUri?: string, speechRate?: number): Promise<void> {
+    const plain = content.trim();
+    if (!plain) return;
 
+    const resolvedVoiceUri = voiceUri || resolveDefaultTtsVoiceUri();
+    const resolvedSpeechRate = speechRate ?? readStoredTtsSpeechRate();
+
+    if (isElevenLabsVoiceUri(resolvedVoiceUri)) {
+      window.speechSynthesis?.cancel();
+      stopAudioPlayback();
+      const session = ++playbackSessionRef.current;
+
+      speakingPlaybackRef.current = {
+        id: messageId,
+        content: plain,
+        voiceUri: resolvedVoiceUri,
+        speechRate: resolvedSpeechRate,
+      };
+      speakingMessageIdRef.current = messageId;
+      setSpeakingMessageId(messageId);
+
+      try {
+        const blob = await requestElevenLabsAudio(
+          plain,
+          parseElevenLabsVoiceId(resolvedVoiceUri),
+          resolvedSpeechRate,
+        );
+        if (playbackSessionRef.current !== session) return;
+        await playElevenLabsBlob(blob, session, messageId);
+      } catch (err) {
+        if (playbackSessionRef.current === session) {
+          speakingPlaybackRef.current = null;
+          speakingMessageIdRef.current = null;
+          setSpeakingMessageId(null);
+          setError(err instanceof Error ? err.message : "Could not play speech");
+        }
+      }
+      return;
+    }
+
+    if (!window.speechSynthesis) return;
+
+    return new Promise((resolve) => {
       window.speechSynthesis.cancel();
       const session = ++playbackSessionRef.current;
       const utterance = new SpeechSynthesisUtterance(plain);
-      const resolvedVoiceUri = voiceUri || resolveDefaultTtsVoiceUri();
-      const resolvedSpeechRate = speechRate ?? readStoredTtsSpeechRate();
       applyTtsVoice(utterance, resolvedVoiceUri, resolvedSpeechRate);
 
       const finishPlayback = () => {
@@ -1736,13 +2127,13 @@ export default function App() {
 
     speechQueueRef.current = speechQueueRef.current
       .then(async () => {
-        const plain = stripMarkdownForSpeech(message.content);
+        const plain = prepareAssistantTextForSpeech(message.content);
         if (!plain) return;
         await speakTextAsync(
           plain,
           message.id,
           resolveTtsVoiceUriForMessage(message, participants, config?.models ?? []),
-          resolveTtsSpeechRateForMessage(message, participants),
+          resolveTtsSpeechRateForMessage(message, participants, agentProfiles),
         );
       })
       .catch(() => {});
@@ -1780,6 +2171,10 @@ export default function App() {
     if (participant.tts_voice_uri?.trim()) {
       return participant.tts_voice_uri.trim();
     }
+    const profile = resolveAgentProfileForParticipant(participant, agentProfiles);
+    if (profile?.tts_voice_uri?.trim()) {
+      return profile.tts_voice_uri.trim();
+    }
     const model = models.find((entry) => entry.id === participant.llm_model_id);
     return resolveTtsVoiceUriForModel(model?.model);
   }
@@ -1795,15 +2190,55 @@ export default function App() {
   }
 
   function speakText(content: string, playbackId: number | "sample", voiceUri?: string, speechRate?: number) {
-    if (!window.speechSynthesis) return;
     const plain = content.trim();
     if (!plain) return;
+
+    const resolvedVoiceUri = voiceUri || resolveDefaultTtsVoiceUri();
+    const resolvedSpeechRate = speechRate ?? readStoredTtsSpeechRate();
+
+    if (isElevenLabsVoiceUri(resolvedVoiceUri)) {
+      window.speechSynthesis?.cancel();
+      stopAudioPlayback();
+      const session = ++playbackSessionRef.current;
+
+      speakingPlaybackRef.current = {
+        id: playbackId,
+        content: plain,
+        voiceUri: resolvedVoiceUri,
+        speechRate: resolvedSpeechRate,
+      };
+      if (typeof playbackId === "number") {
+        speakingMessageIdRef.current = playbackId;
+        setSpeakingMessageId(playbackId);
+      } else {
+        speakingMessageIdRef.current = null;
+        setSpeakingMessageId(null);
+      }
+
+      void requestElevenLabsAudio(
+        plain,
+        parseElevenLabsVoiceId(resolvedVoiceUri),
+        resolvedSpeechRate,
+      )
+        .then((blob) => {
+          if (playbackSessionRef.current !== session) return;
+          return playElevenLabsBlob(blob, session, playbackId);
+        })
+        .catch((err) => {
+          if (playbackSessionRef.current !== session) return;
+          speakingPlaybackRef.current = null;
+          speakingMessageIdRef.current = null;
+          setSpeakingMessageId(null);
+          setError(err instanceof Error ? err.message : "Could not play speech");
+        });
+      return;
+    }
+
+    if (!window.speechSynthesis) return;
 
     window.speechSynthesis.cancel();
     const session = ++playbackSessionRef.current;
     const utterance = new SpeechSynthesisUtterance(plain);
-    const resolvedVoiceUri = voiceUri || resolveDefaultTtsVoiceUri();
-    const resolvedSpeechRate = speechRate ?? readStoredTtsSpeechRate();
     applyTtsVoice(utterance, resolvedVoiceUri, resolvedSpeechRate);
 
     const finishPlayback = () => {
@@ -1847,19 +2282,23 @@ export default function App() {
     setTtsSpeechRate(clamped);
 
     const current = speakingPlaybackRef.current;
-    if (!current || !window.speechSynthesis?.speaking) return;
+    if (!current) return;
+    const isPlaying =
+      Boolean(window.speechSynthesis?.speaking) ||
+      Boolean(audioPlaybackRef.current && !audioPlaybackRef.current.paused);
+    if (!isPlaying) return;
     speakText(current.content, current.id, current.voiceUri, clamped);
   }
 
   function playAssistantMessage(message: Message, selectedText?: string) {
     const selected = selectedText?.trim() || getSelectedTextInMessage(message.id);
-    const plain = selected || stripMarkdownForSpeech(message.content);
+    const plain = selected || prepareAssistantTextForSpeech(message.content);
     if (!plain) return;
     speakText(
       plain,
       message.id,
       resolveTtsVoiceUriForMessage(message, activeParticipants, config?.models ?? []),
-      resolveTtsSpeechRateForMessage(message, activeParticipants),
+      resolveTtsSpeechRateForMessage(message, activeParticipants, agentProfiles),
     );
   }
 
@@ -1877,6 +2316,93 @@ export default function App() {
 
   function playVoiceSample(voiceUri?: string, speechRate?: number) {
     speakText(TTS_SAMPLE_TEXT, "sample", voiceUri, speechRate ?? readStoredTtsSpeechRate());
+  }
+
+  function updateElevenlabsVoiceFilter(key: keyof ElevenLabsVoiceFilters, value: string) {
+    setElevenlabsVoiceFilters((current) => ({ ...current, [key]: value }));
+  }
+
+  function toggleElevenlabsVoiceSort(key: ElevenLabsVoiceSortKey) {
+    setElevenlabsVoiceSort((current) => {
+      if (current?.key !== key) {
+        return { key, direction: "asc" };
+      }
+      if (current.direction === "asc") {
+        return { key, direction: "desc" };
+      }
+      return null;
+    });
+  }
+
+  function renderElevenlabsSortIcon(key: ElevenLabsVoiceSortKey) {
+    if (elevenlabsVoiceSort?.key !== key) {
+      return <ArrowUpDown size={14} />;
+    }
+    return elevenlabsVoiceSort.direction === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />;
+  }
+
+  function renderElevenlabsVoiceColumnHeader(label: string, sortKey: ElevenLabsVoiceSortKey) {
+    return (
+      <>
+        <div className="elevenlabs-column-header">
+          <span>{label}</span>
+          <button
+            type="button"
+            className={`elevenlabs-sort-button ${elevenlabsVoiceSort?.key === sortKey ? "elevenlabs-sort-button-active" : ""}`}
+            onClick={() => toggleElevenlabsVoiceSort(sortKey)}
+            aria-label={`Sort by ${label.toLowerCase()}`}
+          >
+            {renderElevenlabsSortIcon(sortKey)}
+          </button>
+        </div>
+        <input
+          type="search"
+          className="elevenlabs-column-filter"
+          value={elevenlabsVoiceFilters[sortKey]}
+          onChange={(event) => updateElevenlabsVoiceFilter(sortKey, event.target.value)}
+          placeholder="Filter"
+          aria-label={`Filter by ${label.toLowerCase()}`}
+        />
+      </>
+    );
+  }
+
+  function displayElevenlabsVoiceMeta(value?: string | null) {
+    return value?.trim() || "—";
+  }
+
+  async function importElevenLabsVoices(options?: { silent?: boolean; skipApiKeyCheck?: boolean }) {
+    if (!options?.skipApiKeyCheck && !speechConfig?.has_elevenlabs_api_key) {
+      if (!options?.silent) {
+        setError("Save an ElevenLabs API key before importing voices.");
+      }
+      return;
+    }
+
+    if (!options?.silent) {
+      setError("");
+    }
+    setIsImportingElevenlabsVoices(true);
+    try {
+      const voices = await request<ElevenLabsVoice[]>("/api/tts/elevenlabs/voices");
+      setElevenlabsCatalogVoices(voices);
+      persistElevenlabsCatalog(voices);
+      setElevenlabsVoiceFilters(EMPTY_ELEVENLABS_VOICE_FILTERS);
+      setElevenlabsVoiceSort(null);
+      if (!options?.silent) {
+        showSettingsSaveSuccess(
+          voices.length
+            ? `Imported ${voices.length} ElevenLabs voice${voices.length === 1 ? "" : "s"}.`
+            : "No ElevenLabs voices found on this account.",
+        );
+      }
+    } catch (err) {
+      if (!options?.silent) {
+        setError(err instanceof Error ? err.message : "Could not import ElevenLabs voices");
+      }
+    } finally {
+      setIsImportingElevenlabsVoices(false);
+    }
   }
 
   function playModelVoiceSample(voiceUri: string | null | undefined, speechRate?: number) {
@@ -1948,12 +2474,29 @@ export default function App() {
     event.preventDefault();
     setError("");
     try {
+      const payload: Record<string, string | boolean> = {
+        whisper_model: whisperModelDraft,
+        clear_elevenlabs_api_key: clearElevenlabsApiKeyDraft,
+      };
+      if (elevenlabsApiKeyDraft.trim()) {
+        payload.elevenlabs_api_key = elevenlabsApiKeyDraft.trim();
+      }
       const saved = await request<SpeechConfig>("/api/config/speech", {
         method: "PUT",
-        body: JSON.stringify({ whisper_model: whisperModelDraft }),
+        body: JSON.stringify(payload),
       });
       setSpeechConfig(saved);
       setWhisperModelDraft(saved.whisper_model);
+      setElevenlabsApiKeyDraft("");
+      setClearElevenlabsApiKeyDraft(false);
+      if (!saved.has_elevenlabs_api_key) {
+        setElevenlabsCatalogVoices([]);
+        clearStoredElevenlabsCatalog();
+        setElevenlabsVoiceFilters(EMPTY_ELEVENLABS_VOICE_FILTERS);
+        setElevenlabsVoiceSort(null);
+      } else {
+        void importElevenLabsVoices({ silent: true });
+      }
       showSettingsSaveSuccess("Speech settings saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save speech settings");
@@ -1981,26 +2524,107 @@ export default function App() {
     setDefaultPromptDraft(baseline);
   }
 
+  function mergeDetailPreservingOptimistic(
+    serverDetail: ConversationDetail,
+    currentDetail: ConversationDetail | null,
+    conversationId: number,
+  ): ConversationDetail {
+    if (!currentDetail || currentDetail.conversation.id !== conversationId) {
+      return serverDetail;
+    }
+    const job = generationJobsRef.current[conversationId];
+    if (!job) {
+      return serverDetail;
+    }
+
+    const optimisticMessages = currentDetail.messages.filter((message) => message.id < 0);
+    if (!optimisticMessages.length) {
+      return serverDetail;
+    }
+
+    const initialCount = job.initialMessageCount ?? persistedMessageCount(serverDetail.messages);
+    const pendingOptimistic = optimisticMessages.filter((message) => {
+      if (message.role === "user") {
+        if (message.content.trim() === TRANSCRIBING_PLACEHOLDER) {
+          return serverDetail.messages.length <= initialCount;
+        }
+        return !serverDetail.messages.some(
+          (serverMessage) =>
+            serverMessage.role === "user" && serverMessage.content.trim() === message.content.trim(),
+        );
+      }
+      if (message.role === "assistant" && !message.content.trim()) {
+        if (job?.isMultiAgent) {
+          return false;
+        }
+        const lastServer = serverDetail.messages[serverDetail.messages.length - 1];
+        return lastServer?.role !== "assistant" || Boolean(lastServer.content?.trim());
+      }
+      return false;
+    });
+
+    if (!pendingOptimistic.length) {
+      return serverDetail;
+    }
+
+    return {
+      ...serverDetail,
+      messages: [...serverDetail.messages, ...pendingOptimistic],
+    };
+  }
+
+  function updateOptimisticMessageContent(messageId: number, content: string) {
+    setDetail((current) =>
+      current
+        ? {
+            ...current,
+            messages: current.messages.map((message) =>
+              message.id === messageId ? { ...message, content } : message,
+            ),
+          }
+        : current,
+    );
+  }
+
+  function removeOptimisticMessage(messageId: number) {
+    setDetail((current) =>
+      current
+        ? {
+            ...current,
+            messages: current.messages.filter((message) => message.id !== messageId),
+          }
+        : current,
+    );
+  }
+
   function appendOptimisticUserMessage(content: string) {
     if (!activeId) return null;
 
     const userId = -Date.now();
     const createdAt = createOptimisticTimestamp();
-    setDetail((current) =>
-      current && {
+    const optimisticMessage: Message = {
+      id: userId,
+      conversation_id: activeId,
+      role: "user",
+      content,
+      created_at: createdAt,
+    };
+    setDetail((current) => {
+      if (!current || current.conversation.id !== activeId) {
+        const conversation = conversations.find((item) => item.id === activeId);
+        if (!conversation) return current;
+        return {
+          conversation,
+          messages: [optimisticMessage],
+          memories: [],
+          participants: [],
+        };
+      }
+      return {
         ...current,
-        messages: [
-          ...current.messages,
-          {
-            id: userId,
-            conversation_id: activeId,
-            role: "user",
-            content,
-            created_at: createdAt,
-          },
-        ],
-      },
-    );
+        messages: [...current.messages, optimisticMessage],
+      };
+    });
     requestAnimationFrame(() => {
       const messagesEl = document.querySelector(".messages");
       if (messagesEl) {
@@ -2086,7 +2710,7 @@ export default function App() {
   async function loadConversation(conversationId: number) {
     const data = await request<ConversationDetail>(`/api/conversations/${conversationId}`);
     if (activeIdRef.current === conversationId) {
-      setDetail(data);
+      setDetail((current) => mergeDetailPreservingOptimistic(data, current, conversationId));
     }
     setConversations((current) =>
       current.map((item) =>
@@ -2334,6 +2958,57 @@ export default function App() {
     setAgentProfileEditDraft(null);
   }
 
+  function syncParticipantsFromSavedAgentProfile(saved: AgentProfile, previousProfile?: AgentProfile | null) {
+    const previousVoice = (previousProfile?.tts_voice_uri ?? "").trim() || null;
+    const previousRate = previousProfile?.tts_speech_rate ?? null;
+
+    function shouldInheritSavedVoice(participant: ConversationParticipant | ParticipantDraft) {
+      if (participant.agent_profile_id !== saved.id) return false;
+      const participantVoice = (participant.tts_voice_uri ?? "").trim() || null;
+      if (!participantVoice) return true;
+      return participantVoice === previousVoice;
+    }
+
+    function shouldInheritSavedRate(participant: ConversationParticipant | ParticipantDraft) {
+      if (participant.agent_profile_id !== saved.id) return false;
+      if (participant.tts_speech_rate == null) return true;
+      return participant.tts_speech_rate === previousRate;
+    }
+
+    setDetail((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        participants: current.participants.map((participant) => {
+          if (!shouldInheritSavedVoice(participant) && !shouldInheritSavedRate(participant)) {
+            return participant;
+          }
+          return {
+            ...participant,
+            tts_voice_uri: shouldInheritSavedVoice(participant) ? saved.tts_voice_uri : participant.tts_voice_uri,
+            tts_speech_rate: shouldInheritSavedRate(participant) ? saved.tts_speech_rate : participant.tts_speech_rate,
+          };
+        }),
+      };
+    });
+
+    const syncDraft = (participant: ParticipantDraft): ParticipantDraft => {
+      if (!shouldInheritSavedVoice(participant) && !shouldInheritSavedRate(participant)) {
+        return participant;
+      }
+      return {
+        ...participant,
+        tts_voice_uri: shouldInheritSavedVoice(participant)
+          ? saved.tts_voice_uri ?? ""
+          : participant.tts_voice_uri,
+        tts_speech_rate: shouldInheritSavedRate(participant) ? saved.tts_speech_rate : participant.tts_speech_rate,
+      };
+    };
+
+    setParticipantsDraft((current) => current.map(syncDraft));
+    setNewConversationParticipants((current) => current.map(syncDraft));
+  }
+
   async function saveAgentProfileEdit(event?: FormEvent) {
     event?.preventDefault();
     if (!agentProfileEditDraft?.name.trim()) {
@@ -2362,6 +3037,7 @@ export default function App() {
         setAgentProfiles((current) =>
           [...current.filter((item) => item.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)),
         );
+        syncParticipantsFromSavedAgentProfile(saved, editingAgentProfile);
         closeAgentProfileEditor();
         setNotice(`Updated agent "${saved.name}".`);
       }
@@ -2408,10 +3084,21 @@ export default function App() {
     }
   }
 
-  async function loadSpeechConfig() {
+  async function loadSpeechConfig(options?: { autoImportVoices?: boolean }) {
     const data = await request<SpeechConfig>("/api/config/speech");
     setSpeechConfig(data);
     setWhisperModelDraft(data.whisper_model);
+    setElevenlabsApiKeyDraft("");
+    setClearElevenlabsApiKeyDraft(false);
+    if (!data.has_elevenlabs_api_key) {
+      setElevenlabsCatalogVoices([]);
+      clearStoredElevenlabsCatalog();
+      return;
+    }
+    if (options?.autoImportVoices && !elevenlabsCatalogHydratedRef.current) {
+      elevenlabsCatalogHydratedRef.current = true;
+      void importElevenLabsVoices({ silent: true, skipApiKeyCheck: true });
+    }
   }
 
   async function loadPromptConfig() {
@@ -2773,22 +3460,33 @@ export default function App() {
 
     setIsTranscribing(true);
     setError("");
+    let transcribingMessageId: number | null = null;
     try {
+      transcribingMessageId = appendOptimisticUserMessage(TRANSCRIBING_PLACEHOLDER);
       const text = (await transcribeAudio(blob)).trim();
       if (!text) {
+        if (transcribingMessageId != null) {
+          removeOptimisticMessage(transcribingMessageId);
+        }
         setError("No speech detected.");
         return;
       }
-      const initialMessageCount = detail?.messages.length ?? 0;
-      appendOptimisticUserMessage(text);
-      setInput("");
-      setIsTranscribing(false);
+      if (transcribingMessageId != null) {
+        updateOptimisticMessageContent(transcribingMessageId, text);
+      } else {
+        appendOptimisticUserMessage(text);
+      }
+      setInput(text);
+      const initialMessageCount = persistedMessageCount(detail?.messages);
       await submitMessage(text, {
         speakReply: true,
         userMessageAlreadyShown: true,
         initialMessageCount,
       });
     } catch (err) {
+      if (transcribingMessageId != null) {
+        removeOptimisticMessage(transcribingMessageId);
+      }
       setError(err instanceof Error ? err.message : "Could not transcribe speech");
       if (activeId) {
         await loadConversation(activeId);
@@ -2826,12 +3524,15 @@ export default function App() {
       conversations.find((conversation) => conversation.id === conversationId)?.title ??
       "Conversation";
     const modelName = isMultiAgentConversation
-      ? `${activeParticipants.length} agents`
+      ? multiAgentOverrideModel
+        ? `${activeParticipants.length} agents → ${multiAgentOverrideModel.model}`
+        : `${activeParticipants.length} agents`
       : activeModelName;
     const totalSteps = isMultiAgentConversation
       ? activeParticipants.length * Math.max(1, Math.min(10, discussionRounds))
       : 1;
-    const initialMessageCount = options?.initialMessageCount ?? detail?.messages.length ?? 0;
+    const initialMessageCount =
+      options?.initialMessageCount ?? persistedMessageCount(detail?.messages);
     const abortController = new AbortController();
     generationAbortByConversationRef.current.set(conversationId, abortController);
 
@@ -2858,7 +3559,11 @@ export default function App() {
     setGenerationClock(Date.now());
 
     if (content || image) {
-      if (options?.userMessageAlreadyShown) {
+      if (isMultiAgentConversation) {
+        if (!options?.userMessageAlreadyShown) {
+          appendOptimisticUserMessage(content || "Image message");
+        }
+      } else if (options?.userMessageAlreadyShown) {
         appendOptimisticAssistantPlaceholder();
       } else {
         appendOptimisticExchange(content || "Image message");
@@ -2886,6 +3591,7 @@ export default function App() {
         include_all_memories: boolean;
         discussion_rounds?: number;
         answer_length: number;
+        override_llm_model_id?: number;
       } = {
         content,
         include_history: historyLimitToIncludeHistory(
@@ -2899,6 +3605,9 @@ export default function App() {
       };
       if (isMultiAgentConversation) {
         payload.discussion_rounds = Math.max(1, Math.min(10, discussionRounds));
+        if (multiAgentModelOverrideId != null) {
+          payload.override_llm_model_id = multiAgentModelOverrideId;
+        }
       }
       if (image) {
         payload.image_data = image.base64;
@@ -3570,6 +4279,8 @@ export default function App() {
                 const isRemembered = rememberedMessageIds.has(message.id);
                 const isThinkingPlaceholder =
                   message.role === "assistant" && message.id < 0 && !message.content && activeConversationGenerating;
+                const isTranscribingPlaceholder =
+                  message.role === "user" && message.content.trim() === TRANSCRIBING_PLACEHOLDER;
                 const isSpeaking = speakingMessageId === message.id;
                 const speakerLabel = messageSpeakerLabel(
                   message,
@@ -3609,26 +4320,28 @@ export default function App() {
                       <div className="message-meta-actions">
                         {message.role === "assistant" && !isThinkingPlaceholder && (
                           <>
-                            <button
-                              type="button"
-                              className={isSpeaking ? "message-speech-active" : ""}
-                              title="Play message (selection only when text is selected)"
-                              onMouseDown={(event) => {
-                                event.preventDefault();
-                                captureSpeechSelection(message);
-                              }}
-                              onClick={() => handlePlayAssistantMessage(message)}
-                            >
-                              <Play size={15} />
-                            </button>
-                            <button
-                              type="button"
-                              title="Stop playback"
-                              disabled={!isSpeaking}
-                              onClick={stopSpeechPlayback}
-                            >
-                              <Square size={15} />
-                            </button>
+                            {isSpeaking ? (
+                              <button
+                                type="button"
+                                className="message-speech-active"
+                                title="Stop playback"
+                                onClick={stopSpeechPlayback}
+                              >
+                                <Square size={15} />
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                title="Play message (selection only when text is selected)"
+                                onMouseDown={(event) => {
+                                  event.preventDefault();
+                                  captureSpeechSelection(message);
+                                }}
+                                onClick={() => handlePlayAssistantMessage(message)}
+                              >
+                                <Play size={15} />
+                              </button>
+                            )}
                             <label
                               className="message-speech-rate"
                               title="Playback speed"
@@ -3650,7 +4363,7 @@ export default function App() {
                           className={isRemembered ? "remembered-message-button" : ""}
                           title={isRemembered ? "This message is in memory" : "Remember this message"}
                           onClick={() => rememberMessage(message)}
-                          disabled={isThinkingPlaceholder}
+                          disabled={isThinkingPlaceholder || isTranscribingPlaceholder}
                         >
                           <Brain size={15} />
                         </button>
@@ -3659,7 +4372,7 @@ export default function App() {
                           className="message-delete-button"
                           title="Delete message"
                           onClick={() => void deleteMessage(message)}
-                          disabled={isThinkingPlaceholder}
+                          disabled={isThinkingPlaceholder || isTranscribingPlaceholder}
                         >
                           <Trash2 size={15} />
                         </button>
@@ -3670,8 +4383,10 @@ export default function App() {
                       onContextMenu={(event) => openMessageContextMenu(event, message)}
                       onMouseUp={() => handleMessageSelection(message)}
                     >
-                      {isThinkingPlaceholder ? (
-                        <div className="message-thinking">Thinking...</div>
+                      {isThinkingPlaceholder || isTranscribingPlaceholder ? (
+                        <div className="message-thinking">
+                          {isTranscribingPlaceholder ? "Transcribing..." : "Thinking..."}
+                        </div>
                       ) : (
                         <>
                           {messageImageSrc(message) && (
@@ -3756,22 +4471,6 @@ export default function App() {
                 disabled={!activeId || activeConversationGenerating || isTranscribing}
               />
               <div className="composer-actions">
-                <input
-                  ref={imageInputRef}
-                  type="file"
-                  accept="image/jpeg,image/png,image/gif,image/webp"
-                  hidden
-                  onChange={(event) => void handleImageInputChange(event)}
-                />
-                <button
-                  type="button"
-                  className="composer-image"
-                  title="Upload an image"
-                  onClick={() => imageInputRef.current?.click()}
-                  disabled={!activeId || activeConversationGenerating || isTranscribing || isRecording}
-                >
-                  <ImagePlus size={18} />
-                </button>
                 <div className="composer-send-cluster">
                   <div className="composer-send-row">
                     <button
@@ -3785,6 +4484,22 @@ export default function App() {
                     >
                       {isTranscribing ? <Loader2 size={18} className="spin" /> : <Mic size={18} />}
                     </button>
+                    <input
+                      ref={imageInputRef}
+                      type="file"
+                      accept="image/jpeg,image/png,image/gif,image/webp"
+                      hidden
+                      onChange={(event) => void handleImageInputChange(event)}
+                    />
+                    <button
+                      type="button"
+                      className="composer-mic"
+                      title="Upload an image"
+                      onClick={() => imageInputRef.current?.click()}
+                      disabled={!activeId || activeConversationGenerating || isTranscribing || isRecording}
+                    >
+                      <ImagePlus size={18} />
+                    </button>
                     <button
                       type="submit"
                       className="composer-send"
@@ -3796,17 +4511,27 @@ export default function App() {
                   <div className="composer-model-controls">
                     {isMultiAgentConversation ? (
                       <>
-                        <div className="participant-chips">
-                          {activeParticipants.map((participant) => (
-                            <span
-                              key={participant.id}
-                              className="participant-chip"
-                              title={participant.personality.trim() || participant.llm_model || "Agent"}
-                            >
-                              {participantDisplayName(participant, config?.models ?? [])}
-                            </span>
-                          ))}
-                        </div>
+                        <label
+                          className={`composer-model-override ${multiAgentModelOverrideId != null ? "is-active" : ""}`}
+                          title="Override all agents' models for this discussion until cleared"
+                        >
+                          <span>Model</span>
+                          <select
+                            value={multiAgentModelOverrideId ?? ""}
+                            disabled={!activeId || activeConversationGenerating || isTranscribing || !config?.models.length}
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              updateMultiAgentModelOverride(value ? Number(value) : null);
+                            }}
+                          >
+                            <option value="">Agent defaults</option>
+                            {config?.models.map((model) => (
+                              <option key={model.id} value={model.id}>
+                                {model.model} ({model.provider})
+                              </option>
+                            ))}
+                          </select>
+                        </label>
                         <label className="discussion-rounds-input" title="Autonomous discussion rounds before you can reply again">
                           <span>Rounds</span>
                           <input
@@ -4538,54 +5263,195 @@ export default function App() {
             >
               <div>
                 <h2>Speech settings</h2>
-                <p>Choose the Whisper model for microphone input. Assign a playback voice per model above, or set a default fallback here.</p>
+                <p>
+                  Set a default playback voice for reading replies aloud. Configure microphone input and ElevenLabs
+                  voices below.
+                </p>
               </div>
 
-              <label>
-                Speech-to-text model (Whisper)
-                <select
-                  value={whisperModelDraft}
-                  onChange={(event) => setWhisperModelDraft(event.target.value)}
-                >
-                  {(speechConfig?.whisper_model_options ?? Object.keys(WHISPER_MODEL_LABELS)).map((model) => (
-                    <option key={model} value={model}>
-                      {WHISPER_MODEL_LABELS[model] ?? model}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <div className="speech-voice-row">
-                <label>
-                  Default playback voice (fallback)
-                  <select
-                    value={selectedTtsVoiceUri}
-                    onChange={(event) => handleTtsVoiceChange(event.target.value)}
+              <section className="speech-settings-section speech-default-section" aria-labelledby="speech-default-heading">
+                <h3 id="speech-default-heading">Default playback voice</h3>
+                <p>Fallback voice used when a model or agent does not specify its own playback voice.</p>
+                <div className="speech-voice-row">
+                  <label>
+                    Voice
+                    <select
+                      value={selectedTtsVoiceUri}
+                      onChange={(event) => handleTtsVoiceChange(event.target.value)}
+                      disabled={!ttsVoiceOptions.length}
+                    >
+                      {ttsVoiceOptions.length === 0 && <option value="">Loading voices...</option>}
+                      {ttsVoiceOptions.map((voice) => (
+                        <option key={voice.uri} value={voice.uri}>
+                          {voice.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="speech-sample-button"
+                    onClick={() => playVoiceSample()}
                     disabled={!ttsVoiceOptions.length}
                   >
-                    {ttsVoiceOptions.length === 0 && <option value="">Loading voices...</option>}
-                    {ttsVoiceOptions.map((voice) => (
-                      <option key={voice.uri} value={voice.uri}>
-                        {voice.label}
+                    <Play size={16} />
+                    Play sample
+                  </button>
+                </div>
+              </section>
+
+              <div className="speech-settings-divider" role="separator" aria-hidden="true" />
+
+              <section className="speech-settings-section" aria-labelledby="speech-input-heading">
+                <h3 id="speech-input-heading">Speech-to-text</h3>
+                <p>Choose the Whisper model used when you record with the microphone.</p>
+                <label>
+                  Whisper model
+                  <select
+                    value={whisperModelDraft}
+                    onChange={(event) => setWhisperModelDraft(event.target.value)}
+                  >
+                    {(speechConfig?.whisper_model_options ?? Object.keys(WHISPER_MODEL_LABELS)).map((model) => (
+                      <option key={model} value={model}>
+                        {WHISPER_MODEL_LABELS[model] ?? model}
                       </option>
                     ))}
                   </select>
                 </label>
-                <button
-                  type="button"
-                  className="speech-sample-button"
-                  onClick={() => playVoiceSample()}
-                  disabled={!ttsVoiceOptions.length}
-                >
-                  <Play size={16} />
-                  Play sample
+              </section>
+
+              <div className="speech-settings-divider" role="separator" aria-hidden="true" />
+
+              <section className="speech-settings-section speech-elevenlabs-section" aria-labelledby="elevenlabs-voices-heading">
+                <h3 id="elevenlabs-voices-heading">ElevenLabs voices</h3>
+                <p>Connect your ElevenLabs account to import custom and cloned voices into the playback dropdowns.</p>
+
+                <label className="speech-api-key-field">
+                  API key
+                  <MaskedApiKeyInput
+                    value={elevenlabsApiKeyDraft}
+                    preview={speechConfig?.elevenlabs_api_key_preview}
+                    hasApiKey={Boolean(speechConfig?.has_elevenlabs_api_key)}
+                    placeholder={
+                      speechConfig?.has_elevenlabs_api_key
+                        ? "Leave blank to keep current key"
+                        : "Required for ElevenLabs voices"
+                    }
+                    onChange={setElevenlabsApiKeyDraft}
+                  />
+                </label>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={clearElevenlabsApiKeyDraft}
+                    onChange={(event) => setClearElevenlabsApiKeyDraft(event.target.checked)}
+                  />
+                  Clear ElevenLabs key
+                </label>
+
+                <div className="elevenlabs-voices-toolbar">
+                  <button
+                    type="button"
+                    className="elevenlabs-import-button"
+                    onClick={() => void importElevenLabsVoices()}
+                    disabled={!speechConfig?.has_elevenlabs_api_key || isImportingElevenlabsVoices}
+                  >
+                    {isImportingElevenlabsVoices ? <Loader2 size={16} className="spin" /> : <Download size={16} />}
+                    {isImportingElevenlabsVoices ? "Importing..." : "Import voices from account"}
+                  </button>
+                </div>
+
+                {!speechConfig?.has_elevenlabs_api_key && (
+                  <p className="elevenlabs-voices-hint">Save your ElevenLabs API key to import your voice catalog.</p>
+                )}
+
+                {speechConfig?.has_elevenlabs_api_key && elevenlabsCatalogVoices.length === 0 && !isImportingElevenlabsVoices && (
+                  <p className="elevenlabs-voices-hint">No voices imported yet. Click import to load your account catalog.</p>
+                )}
+
+                {elevenlabsCatalogVoices.length > 0 && (
+                  <div className="elevenlabs-voice-table-panel">
+                    <div className="elevenlabs-voice-table-meta">
+                      <p className="elevenlabs-voices-hint">
+                        Showing {displayedElevenlabsCatalogVoices.length} of {elevenlabsCatalogVoices.length} voices
+                      </p>
+                      {hasActiveElevenlabsVoiceFilters && (
+                        <button
+                          type="button"
+                          className="elevenlabs-clear-filters-button"
+                          onClick={() => setElevenlabsVoiceFilters(EMPTY_ELEVENLABS_VOICE_FILTERS)}
+                        >
+                          Clear filters
+                        </button>
+                      )}
+                    </div>
+                    <div className="elevenlabs-voice-table-scroll">
+                      <div className="elevenlabs-voice-list" role="table" aria-label="ElevenLabs voices">
+                        <div className="elevenlabs-voice-list-header" role="row">
+                          <div className="elevenlabs-voice-col elevenlabs-voice-col-name" role="columnheader">
+                            {renderElevenlabsVoiceColumnHeader("Name", "name")}
+                          </div>
+                          <div className="elevenlabs-voice-col elevenlabs-voice-col-gender" role="columnheader">
+                            {renderElevenlabsVoiceColumnHeader("Gender", "gender")}
+                          </div>
+                          <div className="elevenlabs-voice-col elevenlabs-voice-col-age" role="columnheader">
+                            {renderElevenlabsVoiceColumnHeader("Age", "age")}
+                          </div>
+                          <div className="elevenlabs-voice-col elevenlabs-voice-col-characteristics" role="columnheader">
+                            {renderElevenlabsVoiceColumnHeader("Characteristics", "characteristics")}
+                          </div>
+                          <div className="elevenlabs-voice-col elevenlabs-voice-col-sample" role="columnheader">
+                            <span>Sample</span>
+                          </div>
+                        </div>
+
+                        {displayedElevenlabsCatalogVoices.length === 0 ? (
+                          <div className="elevenlabs-voice-list-empty" role="row">
+                            No voices match the current filters.
+                          </div>
+                        ) : (
+                          displayedElevenlabsCatalogVoices.map((voice) => (
+                            <div className="elevenlabs-voice-list-row" role="row" key={voice.voice_id}>
+                              <div className="elevenlabs-voice-col elevenlabs-voice-col-name" role="cell">
+                                <span className="elevenlabs-voice-name">{voice.name}</span>
+                              </div>
+                              <div className="elevenlabs-voice-col elevenlabs-voice-col-gender elevenlabs-voice-trait-cell" role="cell">
+                                {displayElevenlabsVoiceMeta(voice.gender)}
+                              </div>
+                              <div className="elevenlabs-voice-col elevenlabs-voice-col-age elevenlabs-voice-trait-cell" role="cell">
+                                {displayElevenlabsVoiceMeta(voice.age)}
+                              </div>
+                              <div
+                                className="elevenlabs-voice-col elevenlabs-voice-col-characteristics elevenlabs-voice-characteristics-cell"
+                                role="cell"
+                              >
+                                {displayElevenlabsVoiceMeta(voice.characteristics)}
+                              </div>
+                              <div className="elevenlabs-voice-col elevenlabs-voice-col-sample elevenlabs-voice-sample-cell" role="cell">
+                                <button
+                                  type="button"
+                                  className="speech-sample-button elevenlabs-voice-sample-button"
+                                  onClick={() => playVoiceSample(toElevenLabsVoiceUri(voice.voice_id))}
+                                >
+                                  <Play size={16} />
+                                  Play
+                                </button>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </section>
+
+              <div className="speech-settings-actions">
+                <button type="submit">
+                  <Save size={16} />
+                  Save speech settings
                 </button>
               </div>
-
-              <button type="submit">
-                <Save size={16} />
-                Save speech settings
-              </button>
             </form>
             )}
           </section>
@@ -4839,6 +5705,7 @@ export default function App() {
               draft={agentProfileEditDraft}
               onChange={(patch) => setAgentProfileEditDraft((current) => (current ? { ...current, ...patch } : current))}
               models={config.models}
+              agentProfiles={agentProfiles}
               ttsVoiceOptions={ttsVoiceOptions}
               onPlayVoiceSample={playModelVoiceSample}
             />

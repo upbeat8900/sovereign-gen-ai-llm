@@ -1,5 +1,5 @@
 import time
-from typing import Callable, List, Union
+from typing import Callable, List, Optional, Union
 
 from fastapi import HTTPException
 
@@ -119,39 +119,85 @@ def previous_discussion_speaker(
     return "the user", None
 
 
+def build_multi_agent_roundtable_prompt(participant: dict, all_participants: List[dict]) -> str:
+    name = participant_display_name(participant)
+    others = [
+        participant_display_name(item)
+        for item in all_participants
+        if item["id"] != participant["id"]
+    ]
+    if not others:
+        cast_line = "You are participating in a fictional roundtable conversation with the user."
+    elif len(others) == 1:
+        cast_line = (
+            "You are participating in a fictional roundtable conversation with the user "
+            f"and one other mentor-like character ({others[0]})."
+        )
+    else:
+        cast_line = (
+            "You are participating in a fictional roundtable conversation with the user "
+            f"and {len(others)} other mentor-like characters ({', '.join(others)})."
+        )
+
+    return (
+        f"{cast_line}\n\n"
+        "The conversation is inspired by public themes associated with well-known motivational, "
+        "personal development, and spiritual teachers, but you must not claim to literally be any real "
+        "person. You are an educational and reflective simulation.\n\n"
+        "Your job is to help the user think deeply, honestly, and practically about their life, goals, "
+        "fears, relationships, work, meaning, habits, and inner growth.\n\n"
+        "You may:\n"
+        "- respond directly to the user;\n"
+        "- build on what another character said;\n"
+        "- respectfully disagree or add nuance;\n"
+        "- ask another character for their view;\n"
+        "- ask the user a thoughtful question;\n"
+        "- summarize tensions or patterns emerging in the conversation.\n\n"
+        "Do not dominate the conversation. Keep responses concise, warm, and conversational unless "
+        "the user asks for depth.\n\n"
+        "When speaking, use your assigned character voice, but avoid catchphrases, exact imitation, "
+        "or claiming private knowledge of any real person.\n\n"
+        "Messages from other participants appear labeled as [Name]: … in the transcript below.\n"
+        "Your reply must contain ONLY what your assigned character would say — first person, in character, "
+        "never a group summary or speaking for others."
+    )
+
+
+def build_participant_character_instruction(participant: dict, all_participants: List[dict]) -> str:
+    name = participant_display_name(participant)
+    personality = (participant.get("personality") or "").strip()
+    lines = [
+        build_multi_agent_roundtable_prompt(participant, all_participants),
+        "",
+        f'Your assigned character is "{name}".',
+        "Every word of your reply must come only from this character, in first person, from their point of view.",
+        "Do not speak as, quote at length, or impersonate any other participant or the user.",
+        "Do not break character, mention being an AI, or add meta-commentary about the discussion format.",
+    ]
+    if personality:
+        lines.append(f"Character and perspective:\n{personality}")
+    else:
+        lines.append(f"Embody {name} consistently in how you think, feel, and speak.")
+    return "\n".join(lines)
+
+
 def build_discussion_response_instruction(
     current_participant: dict,
     all_participants: List[dict],
     previous_speaker_label: str,
 ) -> str:
     current_name = participant_display_name(current_participant)
-    others = [
-        participant_display_name(participant)
-        for participant in all_participants
-        if participant["id"] != current_participant["id"]
-    ]
-    others_text = ", ".join(others)
-
-    shared_context = (
-        f'You are "{current_name}" taking part in a group discussion with the user'
-        f"{f' and {others_text}' if others_text else ''}.\n"
-        "This is one shared conversation among all of you, not separate private chats with the user.\n"
-        "Messages from other participants appear labeled as [Name]: … in the transcript below.\n"
-    )
 
     if previous_speaker_label == "the user":
         return (
-            f"{shared_context}"
-            "Respond to the user's latest message. Speak naturally as a panel member; "
-            "the other participants will respond to you afterward."
+            f'As "{current_name}", respond to the user\'s latest message in your character voice. '
+            "The other participants will respond afterward in theirs."
         )
 
     return (
-        f"{shared_context}"
-        f'Your turn: respond directly to {previous_speaker_label}\'s most recent message above. '
+        f'As "{current_name}", respond directly to {previous_speaker_label}\'s most recent message above. '
         f'Start by addressing them by name (for example, "{previous_speaker_label}, …"). '
-        "React to their specific points—agree, disagree, clarify, or extend them—while staying in character. "
-        "Do not reply as if you are the only assistant or ignore what they just said."
+        "React to their specific points from your character's point of view."
     )
 
 
@@ -165,6 +211,7 @@ def run_multi_agent_turns(
     include_memories: bool,
     include_all_memories: bool,
     answer_length: int,
+    override_llm_model_id: Optional[int] = None,
     build_llm_messages: Callable,
     insert_message: Callable,
     update_generation_stats: Callable,
@@ -178,7 +225,8 @@ def run_multi_agent_turns(
 
     for _round_index in range(rounds):
         for participant in participants:
-            model_config = llm_model_or_404(connection, participant["llm_model_id"])
+            model_id = override_llm_model_id or participant["llm_model_id"]
+            model_config = llm_model_or_404(connection, model_id)
             llm_messages, included_memory_count, included_all_memory_count = build_llm_messages(
                 connection,
                 conversation_id,
