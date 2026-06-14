@@ -57,6 +57,7 @@ class Memory(BaseModel):
     llm_model: Optional[str] = None
     created_at: str
     archived_at: Optional[str] = None
+    title_pending: bool = False
 
 
 class MemoryGroup(BaseModel):
@@ -159,6 +160,7 @@ class LlmModelRead(BaseModel):
     seconds_per_char: Optional[float] = None
     avg_generation_sec: Optional[float] = None
     reference_generation_estimate_sec: Optional[float] = None
+    tts_voice_uri: Optional[str] = None
 
 
 class LlmModelUpdate(BaseModel):
@@ -170,6 +172,7 @@ class LlmModelUpdate(BaseModel):
     api_key: Optional[str] = None
     clear_api_key: bool = False
     is_active: bool = False
+    tts_voice_uri: Optional[str] = None
 
 
 class LlmConfigRead(BaseModel):

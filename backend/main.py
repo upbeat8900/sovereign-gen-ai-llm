@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Union
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -107,7 +107,14 @@ def _all_active_memories(
             """,
             (exclude_conversation_id,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [_public_memory(dict(row)) for row in rows]
+
+
+def _public_memory(memory: dict) -> dict:
+    public = dict(memory)
+    public["title_pending"] = not public.get("title_generated_at")
+    public.pop("title_generated_at", None)
+    return public
 
 
 def _active_memories(connection, conversation_id: int, sort: str = "created_at", order: str = "desc") -> List[dict]:
@@ -124,7 +131,7 @@ def _active_memories(connection, conversation_id: int, sort: str = "created_at",
         """,
         (conversation_id,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [_public_memory(dict(row)) for row in rows]
 
 
 def _insert_message(
@@ -210,6 +217,34 @@ def _generate_memory_title(connection, content: str, conversation_id: int = None
         return _clean_generated_memory_title(generated_title, content)
     except Exception:
         return fallback_title
+
+
+def _finalize_memory_title(memory_id: int, content: str, conversation_id: int) -> None:
+    with get_connection() as connection:
+        title = _generate_memory_title(connection, content, conversation_id)
+        connection.execute(
+            """
+            UPDATE memories
+            SET title = ?, title_generated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND archived_at IS NULL
+            """,
+            (title, memory_id),
+        )
+
+
+def _schedule_memory_title_generation(
+    background_tasks: BackgroundTasks,
+    memory: dict,
+    conversation_id: int,
+) -> dict:
+    if memory.get("title_pending"):
+        background_tasks.add_task(
+            _finalize_memory_title,
+            memory["id"],
+            memory["content"],
+            conversation_id,
+        )
+    return memory
 
 
 def _generate_integrated_memory(connection, rows: List[dict], target_conversation_id: int = None) -> str:
@@ -305,11 +340,13 @@ def _insert_memory(
 ) -> dict:
     if not llm_model:
         llm_provider, llm_model = _memory_model_from_sources(connection, source_message_id, fallback_model_rows, conversation_id)
-    title = _generate_memory_title(connection, content, conversation_id)
+    title = fallback_memory_title(content)
     cursor = connection.execute(
         """
-        INSERT INTO memories (conversation_id, title, content, source_message_id, llm_provider, llm_model)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO memories (
+            conversation_id, title, content, source_message_id, llm_provider, llm_model, title_generated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL)
         """,
         (conversation_id, title, content, source_message_id, llm_provider, llm_model),
     )
@@ -317,7 +354,8 @@ def _insert_memory(
         "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         (conversation_id,),
     )
-    return row_to_dict(connection.execute("SELECT * FROM memories WHERE id = ?", (cursor.lastrowid,)).fetchone())
+    memory = connection.execute("SELECT * FROM memories WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return _public_memory(dict(memory))
 
 
 def _latest_assistant_message(connection, conversation_id: int) -> dict:
@@ -395,12 +433,14 @@ def _mask_api_key(api_key: str | None) -> str | None:
 
 def _public_model(connection, config: dict) -> dict:
     comments = (config.get("comments") or "").strip() or None
+    tts_voice_uri = (config.get("tts_voice_uri") or "").strip() or None
     return {
         "id": config["id"],
         "provider": config["provider"],
         "base_url": config["base_url"],
         "model": config["model"],
         "comments": comments,
+        "tts_voice_uri": tts_voice_uri,
         "has_api_key": bool(config["api_key"]),
         "api_key_preview": _mask_api_key(config.get("api_key")),
         "is_active": bool(config["is_active"]),
@@ -1094,7 +1134,7 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
 
 
 @app.post("/api/conversations/{conversation_id}/messages", response_model=MessageResponse)
-def send_message(conversation_id: int, payload: MessageCreate) -> dict:
+def send_message(conversation_id: int, payload: MessageCreate, background_tasks: BackgroundTasks) -> dict:
     content = payload.content.strip()
     normalized = content.lower()
     image_data = None
@@ -1108,6 +1148,7 @@ def send_message(conversation_id: int, payload: MessageCreate) -> dict:
         if not image_data and normalized == "remember this message":
             source = _latest_assistant_message(connection, conversation_id)
             memory = _insert_memory(connection, conversation_id, source["content"], source["id"])
+            _schedule_memory_title_generation(background_tasks, memory, conversation_id)
             return {"memory": memory}
 
         if not image_data and normalized.startswith("remember:"):
@@ -1115,6 +1156,7 @@ def send_message(conversation_id: int, payload: MessageCreate) -> dict:
             if not memory_content:
                 raise HTTPException(status_code=400, detail="Provide text after remember:")
             memory = _insert_memory(connection, conversation_id, memory_content)
+            _schedule_memory_title_generation(background_tasks, memory, conversation_id)
             return {"memory": memory}
 
         message_content = content
@@ -1198,20 +1240,21 @@ def delete_message(conversation_id: int, message_id: int) -> dict:
 
 
 @app.post("/api/conversations/{conversation_id}/remember", response_model=Memory)
-def remember_message(conversation_id: int, payload: RememberCreate) -> dict:
+def remember_message(conversation_id: int, payload: RememberCreate, background_tasks: BackgroundTasks) -> dict:
     with get_connection() as connection:
         _conversation_or_404(connection, conversation_id)
         if payload.message_id is not None:
             source = _message_or_404(connection, conversation_id, payload.message_id)
             content = (payload.content or "").strip() or source["content"]
-            return _insert_memory(connection, conversation_id, content, source["id"])
-
-        content = (payload.content or "").strip()
-        if content:
-            return _insert_memory(connection, conversation_id, content)
-
-        source = _latest_assistant_message(connection, conversation_id)
-        return _insert_memory(connection, conversation_id, source["content"], source["id"])
+            memory = _insert_memory(connection, conversation_id, content, source["id"])
+        else:
+            content = (payload.content or "").strip()
+            if content:
+                memory = _insert_memory(connection, conversation_id, content)
+            else:
+                source = _latest_assistant_message(connection, conversation_id)
+                memory = _insert_memory(connection, conversation_id, source["content"], source["id"])
+    return _schedule_memory_title_generation(background_tasks, memory, conversation_id)
 
 
 @app.get("/api/conversations/{conversation_id}/memories", response_model=List[Memory])
@@ -1268,7 +1311,7 @@ def move_memory(memory_id: int, payload: MemoryMove) -> dict:
             "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id IN (?, ?)",
             (memory["conversation_id"], payload.target_conversation_id),
         )
-        return row_to_dict(connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone())
+        return _public_memory(dict(connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()))
 
 
 @app.delete("/api/conversations/{conversation_id}/memories/{memory_id}")
@@ -1285,7 +1328,7 @@ def delete_memory(conversation_id: int, memory_id: int) -> dict:
 
 
 @app.post("/api/memories/merge", response_model=Memory)
-def merge_memories_across_conversations(payload: CrossConversationMemoryMerge) -> dict:
+def merge_memories_across_conversations(payload: CrossConversationMemoryMerge, background_tasks: BackgroundTasks) -> dict:
     memory_ids = sorted(set(payload.memory_ids))
     placeholders = ",".join("?" for _ in memory_ids)
     with get_connection() as connection:
@@ -1321,11 +1364,11 @@ def merge_memories_across_conversations(payload: CrossConversationMemoryMerge) -
             f"UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id IN ({touched_placeholders})",
             list(touched_conversation_ids),
         )
-        return merged
+        return _schedule_memory_title_generation(background_tasks, merged, payload.target_conversation_id)
 
 
 @app.post("/api/memories/integrate", response_model=Memory)
-def integrate_memories(payload: MemoryIntegrate) -> dict:
+def integrate_memories(payload: MemoryIntegrate, background_tasks: BackgroundTasks) -> dict:
     memory_ids = sorted(set(payload.memory_ids))
     if len(memory_ids) < 2:
         raise HTTPException(status_code=400, detail="Select at least two memories to integrate")
@@ -1357,11 +1400,11 @@ def integrate_memories(payload: MemoryIntegrate) -> dict:
             f"UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id IN ({touched_placeholders})",
             list(touched_conversation_ids),
         )
-        return integrated
+        return _schedule_memory_title_generation(background_tasks, integrated, target_conversation_id)
 
 
 @app.post("/api/conversations/{conversation_id}/memories/merge", response_model=Memory)
-def merge_memories(conversation_id: int, payload: MemoryMerge) -> dict:
+def merge_memories(conversation_id: int, payload: MemoryMerge, background_tasks: BackgroundTasks) -> dict:
     memory_ids = sorted(set(payload.memory_ids))
     placeholders = ",".join("?" for _ in memory_ids)
     with get_connection() as connection:
@@ -1385,7 +1428,7 @@ def merge_memories(conversation_id: int, payload: MemoryMerge) -> dict:
             """,
             [conversation_id, *memory_ids],
         )
-        return merged
+        return _schedule_memory_title_generation(background_tasks, merged, conversation_id)
 
 
 @app.get("/api/config/llm", response_model=LlmConfigRead)
@@ -1421,6 +1464,7 @@ def update_llm_config(payload: LlmConfigUpdate) -> dict:
             base_url = model_payload.base_url.strip().rstrip("/")
             model = model_payload.model.strip()
             comments = (model_payload.comments or "").strip() or None
+            tts_voice_uri = (model_payload.tts_voice_uri or "").strip() or None
             if not base_url or not model:
                 raise HTTPException(status_code=400, detail="Model rows need an address and model name")
 
@@ -1436,20 +1480,20 @@ def update_llm_config(payload: LlmConfigUpdate) -> dict:
                 connection.execute(
                     """
                     UPDATE llm_models
-                    SET provider = ?, base_url = ?, model = ?, comments = ?, api_key = ?, is_active = 0,
-                        updated_at = CURRENT_TIMESTAMP
+                    SET provider = ?, base_url = ?, model = ?, comments = ?, api_key = ?, tts_voice_uri = ?,
+                        is_active = 0, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (provider, base_url, model, comments, api_key, model_payload.id),
+                    (provider, base_url, model, comments, api_key, tts_voice_uri, model_payload.id),
                 )
                 model_id = model_payload.id
             else:
                 cursor = connection.execute(
                     """
-                    INSERT INTO llm_models (provider, base_url, model, comments, api_key, is_active)
-                    VALUES (?, ?, ?, ?, ?, 0)
+                    INSERT INTO llm_models (provider, base_url, model, comments, api_key, tts_voice_uri, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
                     """,
-                    (provider, base_url, model, comments, api_key),
+                    (provider, base_url, model, comments, api_key, tts_voice_uri),
                 )
                 model_id = cursor.lastrowid
 

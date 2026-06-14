@@ -73,6 +73,7 @@ type Memory = {
   llm_model?: string | null;
   created_at: string;
   archived_at?: string | null;
+  title_pending?: boolean;
 };
 
 type ConversationDetail = {
@@ -102,6 +103,7 @@ type LlmModel = {
   seconds_per_char?: number | null;
   avg_generation_sec?: number | null;
   reference_generation_estimate_sec?: number | null;
+  tts_voice_uri?: string | null;
 };
 
 type LlmConfig = {
@@ -328,6 +330,33 @@ const PROVIDER_DEFAULTS = {
 
 type ProviderKey = keyof typeof PROVIDER_DEFAULTS;
 
+function buildFallbackMemoryTitle(content: string) {
+  const firstLine = content.split("\n").map((line) => line.trim()).find(Boolean) ?? content;
+  const text = firstLine.replace(/[#*_`>\[\]()]|https?:\/\/\S+/g, " ").replace(/\s+/g, " ").trim();
+  const words = text.split(" ").slice(0, 9).join(" ").trim().replace(/[ .,:;-]+$/, "");
+  if (!words) return "Untitled memory";
+  return words.length > 72 ? `${words.slice(0, 72).trim()}...` : words;
+}
+
+function buildOptimisticMemory(message: Message, conversationId: number): Memory {
+  const content = message.content.trim();
+  return {
+    id: -message.id,
+    conversation_id: conversationId,
+    title: buildFallbackMemoryTitle(content),
+    content,
+    source_message_id: message.id,
+    llm_provider: message.llm_provider,
+    llm_model: message.llm_model,
+    created_at: new Date().toISOString(),
+    title_pending: true,
+  };
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function providerDefaults(provider: string) {
   return PROVIDER_DEFAULTS[(provider as ProviderKey) in PROVIDER_DEFAULTS ? (provider as ProviderKey) : "ollama"];
 }
@@ -339,6 +368,7 @@ function createAddModelDraft(isFirstModel: boolean): LlmModel {
     base_url: defaults.base_url,
     model: defaults.model,
     comments: "",
+    tts_voice_uri: "",
     is_active: isFirstModel,
     api_key: "",
     clear_api_key: false,
@@ -611,6 +641,20 @@ function generationProgressPercent(elapsedSec: number, estimateSec: number | nul
   return Math.min(95, Math.max(2, (elapsedSec / estimateSec) * 100));
 }
 
+type GenerationJob = {
+  conversationId: number;
+  conversationTitle: string;
+  modelName: string;
+  contextPreview: LlmContextPreview | null;
+  startedAt: number;
+};
+
+type CompletedGenerationAlert = {
+  conversationId: number;
+  title: string;
+  error?: string;
+};
+
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -634,13 +678,13 @@ export default function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [settingsSaveSuccessMessage, setSettingsSaveSuccessMessage] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
+  const [generationJobs, setGenerationJobs] = useState<Record<number, GenerationJob>>({});
+  const [progressModalConversationId, setProgressModalConversationId] = useState<number | null>(null);
+  const [completedGenerationAlert, setCompletedGenerationAlert] = useState<CompletedGenerationAlert | null>(null);
+  const [generationClock, setGenerationClock] = useState(() => Date.now());
   const [historyMessageLimit, setHistoryMessageLimit] = useState(readStoredHistoryMessageLimit);
   const [includeMemories, setIncludeMemories] = useState(readStoredIncludeMemories);
   const [includeAllMemories, setIncludeAllMemories] = useState(readStoredIncludeAllMemories);
-  const [llmProgressModel, setLlmProgressModel] = useState("");
-  const [generationElapsedSec, setGenerationElapsedSec] = useState(0);
-  const [llmContextPreview, setLlmContextPreview] = useState<LlmContextPreview | null>(null);
   const [memorySearch, setMemorySearch] = useState("");
   const [memorySort, setMemorySort] = useState<"created_at" | "title" | "llm_model">("created_at");
   const [memoryModelFilter, setMemoryModelFilter] = useState("");
@@ -680,10 +724,10 @@ export default function App() {
   const mediaChunksRef = useRef<Blob[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const speakingMessageIdRef = useRef<number | null>(null);
-  const speakingPlaybackRef = useRef<{ id: number | "sample"; content: string } | null>(null);
+  const speakingPlaybackRef = useRef<{ id: number | "sample"; content: string; voiceUri?: string } | null>(null);
   const playbackSessionRef = useRef(0);
-  const generationAbortRef = useRef<AbortController | null>(null);
-  const generationStartedAtRef = useRef<number | null>(null);
+  const generationAbortByConversationRef = useRef(new Map<number, AbortController>());
+  const activeIdRef = useRef<number | null>(null);
   const speechSelectionRef = useRef<{ messageId: number; text: string } | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingLatestScrollRef = useRef(false);
@@ -773,6 +817,32 @@ export default function App() {
     return config?.models.find((model) => model.id === modelId) ?? config?.active_model ?? null;
   }, [config, detail?.conversation.llm_model_id]);
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
+  const activeConversationGenerating = activeId != null && activeId in generationJobs;
+  const progressModalJob =
+    progressModalConversationId != null ? generationJobs[progressModalConversationId] ?? null : null;
+  const progressModalElapsedSec = progressModalJob
+    ? Math.floor((generationClock - progressModalJob.startedAt) / 1000)
+    : 0;
+  const chatMessages = useMemo(() => {
+    const base = detail?.messages ?? [];
+    if (!activeId || !generationJobs[activeId]) return base;
+    const last = base[base.length - 1];
+    if (last?.role === "assistant" && !last.content && last.id < 0) return base;
+    if (last?.role === "user") {
+      return [
+        ...base,
+        {
+          id: -generationJobs[activeId].startedAt,
+          conversation_id: activeId,
+          role: "assistant" as const,
+          content: "",
+          llm_model: generationJobs[activeId].modelName,
+          created_at: new Date().toISOString(),
+        },
+      ];
+    }
+    return base;
+  }, [detail?.messages, activeId, generationJobs]);
   const historyContextOverhead = llmContextOverhead(
     detail?.memories.length ?? 0,
     includeMemories,
@@ -803,7 +873,7 @@ export default function App() {
     });
   }, [activeId, historyContextOverhead, historyDbMessageCount, historySliderMinValue, historySliderMaxValue]);
 
-  const historyControlsDisabled = !activeId || sending || isTranscribing;
+  const historyControlsDisabled = !activeId || activeConversationGenerating || isTranscribing;
 
   function updateHistoryMessageLimit(next: number) {
     const stored = storedHistoryLimitFromContextTotal(next, historySliderMinValue, historySliderMaxValue);
@@ -858,20 +928,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!sending) {
-      setGenerationElapsedSec(0);
-      return;
-    }
+    activeIdRef.current = activeId;
+  }, [activeId]);
 
-    const startedAt = generationStartedAtRef.current ?? Date.now();
-    const tick = () => {
-      setGenerationElapsedSec(Math.floor((Date.now() - startedAt) / 1000));
-    };
-
-    tick();
-    const intervalId = window.setInterval(tick, 1000);
+  useEffect(() => {
+    if (!Object.keys(generationJobs).length) return;
+    const intervalId = window.setInterval(() => setGenerationClock(Date.now()), 1000);
     return () => window.clearInterval(intervalId);
-  }, [sending]);
+  }, [generationJobs]);
 
   useEffect(() => {
     if (page === "settings") {
@@ -1014,7 +1078,21 @@ export default function App() {
     setSpeakingMessageId(null);
   }
 
-  function speakText(content: string, playbackId: number | "sample") {
+  function resolveDefaultTtsVoiceUri() {
+    return selectedTtsVoiceUri || localStorage.getItem(TTS_VOICE_STORAGE_KEY) || "";
+  }
+
+  function resolveTtsVoiceUriForModel(modelName: string | null | undefined) {
+    if (modelName && config?.models) {
+      const match = config.models.find((entry) => entry.model === modelName);
+      if (match?.tts_voice_uri) {
+        return match.tts_voice_uri;
+      }
+    }
+    return resolveDefaultTtsVoiceUri();
+  }
+
+  function speakText(content: string, playbackId: number | "sample", voiceUri?: string) {
     if (!window.speechSynthesis) return;
     const plain = content.trim();
     if (!plain) return;
@@ -1022,7 +1100,8 @@ export default function App() {
     window.speechSynthesis.cancel();
     const session = ++playbackSessionRef.current;
     const utterance = new SpeechSynthesisUtterance(plain);
-    applyTtsVoice(utterance);
+    const resolvedVoiceUri = voiceUri || resolveDefaultTtsVoiceUri();
+    applyTtsVoice(utterance, resolvedVoiceUri);
 
     const finishPlayback = () => {
       if (playbackSessionRef.current !== session) return;
@@ -1036,7 +1115,7 @@ export default function App() {
     utterance.onend = finishPlayback;
     utterance.onerror = finishPlayback;
 
-    speakingPlaybackRef.current = { id: playbackId, content: plain };
+    speakingPlaybackRef.current = { id: playbackId, content: plain, voiceUri: resolvedVoiceUri };
     if (typeof playbackId === "number") {
       speakingMessageIdRef.current = playbackId;
       setSpeakingMessageId(playbackId);
@@ -1047,8 +1126,8 @@ export default function App() {
     window.speechSynthesis.speak(utterance);
   }
 
-  function applyTtsVoice(utterance: SpeechSynthesisUtterance) {
-    const voice = resolveTtsVoice(selectedTtsVoiceUri || localStorage.getItem(TTS_VOICE_STORAGE_KEY) || "");
+  function applyTtsVoice(utterance: SpeechSynthesisUtterance, voiceUri?: string) {
+    const voice = resolveTtsVoice(voiceUri || resolveDefaultTtsVoiceUri());
     if (voice) {
       utterance.voice = voice;
     }
@@ -1061,14 +1140,14 @@ export default function App() {
 
     const current = speakingPlaybackRef.current;
     if (!current || !window.speechSynthesis?.speaking) return;
-    speakText(current.content, current.id);
+    speakText(current.content, current.id, current.voiceUri);
   }
 
   function playAssistantMessage(message: Message, selectedText?: string) {
     const selected = selectedText?.trim() || getSelectedTextInMessage(message.id);
     const plain = selected || stripMarkdownForSpeech(message.content);
     if (!plain) return;
-    speakText(plain, message.id);
+    speakText(plain, message.id, resolveTtsVoiceUriForModel(message.llm_model));
   }
 
   function captureSpeechSelection(message: Message) {
@@ -1083,8 +1162,12 @@ export default function App() {
     playAssistantMessage(message, selected);
   }
 
-  function playVoiceSample() {
-    speakText(TTS_SAMPLE_TEXT, "sample");
+  function playVoiceSample(voiceUri?: string) {
+    speakText(TTS_SAMPLE_TEXT, "sample", voiceUri);
+  }
+
+  function playModelVoiceSample(voiceUri: string | null | undefined) {
+    playVoiceSample(voiceUri || undefined);
   }
 
   function handleTtsVoiceChange(voiceUri: string) {
@@ -1231,7 +1314,53 @@ export default function App() {
 
   async function loadConversation(conversationId: number) {
     const data = await request<ConversationDetail>(`/api/conversations/${conversationId}`);
-    setDetail(data);
+    if (activeIdRef.current === conversationId) {
+      setDetail(data);
+    }
+  }
+
+  function updateGenerationJob(conversationId: number, patch: Partial<GenerationJob>) {
+    setGenerationJobs((current) => {
+      const job = current[conversationId];
+      if (!job) return current;
+      return { ...current, [conversationId]: { ...job, ...patch } };
+    });
+  }
+
+  function removeGenerationJob(conversationId: number) {
+    setGenerationJobs((current) => {
+      if (!(conversationId in current)) return current;
+      const next = { ...current };
+      delete next[conversationId];
+      return next;
+    });
+    generationAbortByConversationRef.current.delete(conversationId);
+    setProgressModalConversationId((current) => (current === conversationId ? null : current));
+  }
+
+  function dismissProgressModal() {
+    setProgressModalConversationId(null);
+  }
+
+  function cancelGeneration(conversationId?: number) {
+    const targetId = conversationId ?? progressModalConversationId ?? activeId;
+    if (targetId == null) return;
+    generationAbortByConversationRef.current.get(targetId)?.abort();
+  }
+
+  async function goToCompletedAnswer() {
+    const alert = completedGenerationAlert;
+    if (!alert) return;
+    setCompletedGenerationAlert(null);
+    pendingLatestScrollRef.current = true;
+    setPage("chat");
+    setMessageContextMenu(null);
+    setSelectedClip(null);
+    if (activeId !== alert.conversationId) {
+      setActiveId(alert.conversationId);
+      return;
+    }
+    await loadConversation(alert.conversationId);
   }
 
   async function loadMemoryGroups() {
@@ -1514,7 +1643,7 @@ export default function App() {
   }
 
   async function startVoiceCapture() {
-    if (!activeId || sending || isTranscribing || isRecordingRef.current) return;
+    if (!activeId || activeConversationGenerating || isTranscribing || isRecordingRef.current) return;
     if (!navigator.mediaDevices?.getUserMedia) {
       setError("Microphone capture is not supported in this browser.");
       return;
@@ -1573,7 +1702,6 @@ export default function App() {
         setError("No speech detected.");
         return;
       }
-      appendOptimisticExchange(text);
       setInput("");
       await submitMessage(text, { speakReply: true });
     } catch (err) {
@@ -1595,25 +1723,41 @@ export default function App() {
     await submitMessage();
   }
 
-  function cancelGeneration() {
-    generationAbortRef.current?.abort();
-  }
-
   async function submitMessage(overrideContent?: string, options?: { speakReply?: boolean; image?: PendingImage | null }) {
     const image = options?.image === undefined ? pendingImage : options.image;
     const content = (overrideContent ?? input).trim();
-    if (!activeId || sending || (!content && !image)) return;
+    const conversationId = activeId;
+    if (!conversationId || conversationId in generationJobs || (!content && !image)) return;
 
+    const conversationTitle =
+      detail?.conversation.title ??
+      conversations.find((conversation) => conversation.id === conversationId)?.title ??
+      "Conversation";
+    const modelName = activeModelName;
     const abortController = new AbortController();
-    generationAbortRef.current = abortController;
-    generationStartedAtRef.current = Date.now();
-    setGenerationElapsedSec(0);
+    generationAbortByConversationRef.current.set(conversationId, abortController);
 
-    setSending(true);
-    setLlmProgressModel(activeModelName);
-    setLlmContextPreview(null);
+    setGenerationJobs((current) => ({
+      ...current,
+      [conversationId]: {
+        conversationId,
+        conversationTitle,
+        modelName,
+        contextPreview: null,
+        startedAt: Date.now(),
+      },
+    }));
+    setProgressModalConversationId(conversationId);
+    setGenerationClock(Date.now());
+
+    if (content || image) {
+      appendOptimisticExchange(content || "Image message");
+    }
+    setInput("");
+    clearPendingImage();
     setError("");
     setNotice("");
+
     try {
       const payload: {
         content: string;
@@ -1640,50 +1784,65 @@ export default function App() {
       const requestOptions = { signal: abortController.signal };
 
       try {
-        const preview = await request<LlmContextPreview>(`/api/conversations/${activeId}/llm-context-preview`, {
+        const preview = await request<LlmContextPreview>(`/api/conversations/${conversationId}/llm-context-preview`, {
           method: "POST",
           body: JSON.stringify(payload),
           ...requestOptions,
         });
-        setLlmContextPreview(preview);
+        updateGenerationJob(conversationId, { contextPreview: preview });
       } catch (err) {
         if (isAbortError(err)) throw err;
-        setLlmContextPreview(null);
+        updateGenerationJob(conversationId, { contextPreview: null });
       }
 
       const response = await request<{
         user_message?: Message;
         assistant_message?: Message;
         memory?: Memory;
-      }>(`/api/conversations/${activeId}/messages`, {
+      }>(`/api/conversations/${conversationId}/messages`, {
         method: "POST",
         body: JSON.stringify(payload),
         ...requestOptions,
       });
-      setInput("");
-      clearPendingImage();
-      if (response.memory) {
-        setNotice("Saved to this conversation's memory bank.");
-      }
-      await loadConversation(activeId);
+
+      removeGenerationJob(conversationId);
+      await loadConversation(conversationId);
       await loadConversations();
-      if (options?.speakReply && response.assistant_message?.content) {
-        playAssistantMessage(response.assistant_message);
+
+      if (activeIdRef.current === conversationId) {
+        if (response.memory) {
+          applyRememberedMemory(response.memory);
+          setNotice("Saved to this conversation's memory bank.");
+        }
+        if (options?.speakReply && response.assistant_message?.content) {
+          playAssistantMessage(response.assistant_message);
+        }
+      } else {
+        setCompletedGenerationAlert({
+          conversationId,
+          title: conversationTitle,
+        });
       }
     } catch (err) {
+      removeGenerationJob(conversationId);
       if (isAbortError(err)) {
-        setNotice("Generation cancelled.");
-        await loadConversation(activeId);
+        if (activeIdRef.current === conversationId) {
+          setNotice("Generation cancelled.");
+        }
+        await loadConversation(conversationId);
       } else {
-        setError(err instanceof Error ? err.message : "Could not send message");
-        await loadConversation(activeId);
+        const message = err instanceof Error ? err.message : "Could not send message";
+        if (activeIdRef.current === conversationId) {
+          setError(message);
+        } else {
+          setCompletedGenerationAlert({
+            conversationId,
+            title: conversationTitle,
+            error: message,
+          });
+        }
+        await loadConversation(conversationId);
       }
-    } finally {
-      generationAbortRef.current = null;
-      generationStartedAtRef.current = null;
-      setSending(false);
-      setLlmProgressModel("");
-      setLlmContextPreview(null);
     }
   }
 
@@ -1699,21 +1858,80 @@ export default function App() {
     }
   }
 
+  async function pollMemoryTitleUpdate(memoryId: number, conversationId: number) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(2000);
+      try {
+        const memories = await request<Memory[]>(`/api/conversations/${conversationId}/memories`);
+        const updated = memories.find((memory) => memory.id === memoryId);
+        if (!updated || !updated.title_pending) {
+          if (updated) {
+            setDetail((current) =>
+              current?.conversation.id === conversationId
+                ? {
+                    ...current,
+                    memories: current.memories.map((memory) => (memory.id === memoryId ? updated : memory)),
+                  }
+                : current,
+            );
+            if (page === "memories") {
+              await loadMemoryGroups();
+            }
+          }
+          return;
+        }
+      } catch {
+        return;
+      }
+    }
+  }
+
+  function applyRememberedMemory(memory: Memory, optimisticId?: number) {
+    setDetail((current) =>
+      current
+        ? {
+            ...current,
+            memories: [
+              memory,
+              ...current.memories.filter(
+                (entry) =>
+                  entry.id !== optimisticId &&
+                  entry.source_message_id !== memory.source_message_id,
+              ),
+            ],
+          }
+        : current,
+    );
+    if (memory.title_pending) {
+      void pollMemoryTitleUpdate(memory.id, memory.conversation_id);
+    }
+  }
+
   async function rememberMessage(message: Message) {
-    if (!activeId) return;
+    if (!activeId || rememberedMessageIds.has(message.id)) return;
+    const conversationId = activeId;
+    const optimisticMemory = buildOptimisticMemory(message, conversationId);
     setError("");
-    setLlmProgressModel(activeModelName);
+    applyRememberedMemory(optimisticMemory);
+    setNotice("Saving to memory...");
+
     try {
-      const memory = await request<Memory>(`/api/conversations/${activeId}/remember`, {
+      const memory = await request<Memory>(`/api/conversations/${conversationId}/remember`, {
         method: "POST",
         body: JSON.stringify({ message_id: message.id }),
       });
+      applyRememberedMemory(memory, optimisticMemory.id);
       setNotice("Message saved to memory.");
-      setDetail((current) => current && { ...current, memories: [memory, ...current.memories] });
     } catch (err) {
+      setDetail((current) =>
+        current
+          ? {
+              ...current,
+              memories: current.memories.filter((entry) => entry.id !== optimisticMemory.id),
+            }
+          : current,
+      );
       setError(err instanceof Error ? err.message : "Could not save message to memory");
-    } finally {
-      setLlmProgressModel("");
     }
   }
 
@@ -1773,21 +1991,39 @@ export default function App() {
 
   async function rememberSelectedClip() {
     if (!activeId || !selectedClip) return;
+    const conversationId = activeId;
+    const optimisticMemory: Memory = {
+      id: -selectedClip.messageId,
+      conversation_id: conversationId,
+      title: buildFallbackMemoryTitle(selectedClip.content),
+      content: selectedClip.content,
+      source_message_id: selectedClip.messageId,
+      created_at: new Date().toISOString(),
+      title_pending: true,
+    };
     setError("");
-    setLlmProgressModel(activeModelName);
+    applyRememberedMemory(optimisticMemory);
+    setNotice("Saving clip to memory...");
+
     try {
-      const memory = await request<Memory>(`/api/conversations/${activeId}/remember`, {
+      const memory = await request<Memory>(`/api/conversations/${conversationId}/remember`, {
         method: "POST",
         body: JSON.stringify({ content: selectedClip.content, message_id: selectedClip.messageId }),
       });
+      applyRememberedMemory(memory, optimisticMemory.id);
       setNotice("Selected clip saved to memory.");
-      setDetail((current) => current && { ...current, memories: [memory, ...current.memories] });
       setSelectedClip(null);
       window.getSelection()?.removeAllRanges();
     } catch (err) {
+      setDetail((current) =>
+        current
+          ? {
+              ...current,
+              memories: current.memories.filter((entry) => entry.id !== optimisticMemory.id),
+            }
+          : current,
+      );
       setError(err instanceof Error ? err.message : "Could not save selected clip");
-    } finally {
-      setLlmProgressModel("");
     }
   }
 
@@ -1807,7 +2043,6 @@ export default function App() {
     if (!content) return;
 
     setError("");
-    setLlmProgressModel(activeModelName);
     try {
       await request<Memory>("/api/memories/merge", {
         method: "POST",
@@ -1826,8 +2061,6 @@ export default function App() {
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not merge selected memories");
-    } finally {
-      setLlmProgressModel("");
     }
   }
 
@@ -1835,7 +2068,6 @@ export default function App() {
     if (selectedMemoryIds.length < 2) return;
 
     setError("");
-    setLlmProgressModel(activeModelName);
     try {
       await request<Memory>("/api/memories/integrate", {
         method: "POST",
@@ -1850,8 +2082,6 @@ export default function App() {
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not integrate selected memories");
-    } finally {
-      setLlmProgressModel("");
     }
   }
 
@@ -1883,6 +2113,7 @@ export default function App() {
         base_url: model.base_url,
         model: model.model,
         comments: model.comments?.trim() || undefined,
+        tts_voice_uri: model.tts_voice_uri?.trim() || undefined,
         is_active: activeIndex === -1 ? index === 0 : model.is_active,
         clear_api_key: Boolean(model.clear_api_key),
       };
@@ -2154,16 +2385,17 @@ export default function App() {
             </header>
 
             <div className="messages">
-              {!detail?.messages.length && (
+              {!chatMessages.length && (
                 <div className="empty-state">
                   <Brain size={32} />
                   <h2>No messages yet</h2>
                   <p>Create or select a conversation, then ask something. Memories stay scoped here.</p>
                 </div>
               )}
-              {detail?.messages.map((message) => {
+              {chatMessages.map((message) => {
                 const isRemembered = rememberedMessageIds.has(message.id);
-                const isThinkingPlaceholder = message.role === "assistant" && message.id < 0 && !message.content && sending;
+                const isThinkingPlaceholder =
+                  message.role === "assistant" && message.id < 0 && !message.content && activeConversationGenerating;
                 const isSpeaking = speakingMessageId === message.id;
                 return (
                   <article id={`message-${message.id}`} key={message.id} className={`message ${message.role}`}>
@@ -2338,7 +2570,7 @@ export default function App() {
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
                 onPaste={handleComposerPaste}
-                disabled={!activeId || sending || isTranscribing}
+                disabled={!activeId || activeConversationGenerating || isTranscribing}
               />
               <div className="composer-actions">
                 <input
@@ -2353,7 +2585,7 @@ export default function App() {
                   className="composer-image"
                   title="Upload an image"
                   onClick={() => imageInputRef.current?.click()}
-                  disabled={!activeId || sending || isTranscribing || isRecording}
+                  disabled={!activeId || activeConversationGenerating || isTranscribing || isRecording}
                 >
                   <ImagePlus size={18} />
                 </button>
@@ -2362,20 +2594,20 @@ export default function App() {
                     <button
                       type="button"
                       className={`composer-mic ${isRecording ? "composer-mic-recording" : ""} ${
-                        !isRecording && (isTranscribing || sending) ? "composer-mic-busy" : ""
+                        !isRecording && (isTranscribing || activeConversationGenerating) ? "composer-mic-busy" : ""
                       }`}
                       title={isRecording ? "Click again to stop and send" : "Start voice input"}
                       onClick={toggleVoiceCapture}
-                      disabled={!activeId || sending || isTranscribing}
+                      disabled={!activeId || activeConversationGenerating || isTranscribing}
                     >
                       {isTranscribing ? <Loader2 size={18} className="spin" /> : <Mic size={18} />}
                     </button>
                     <button
                       type="submit"
                       className="composer-send"
-                      disabled={!activeId || sending || isTranscribing || (!isRecording && !input.trim() && !pendingImage)}
+                      disabled={!activeId || activeConversationGenerating || isTranscribing || (!isRecording && !input.trim() && !pendingImage)}
                     >
-                      {isTranscribing ? "Transcribing..." : sending ? "Thinking..." : isRecording ? "Stop & send" : "Send"}
+                      {isTranscribing ? "Transcribing..." : activeConversationGenerating ? "Thinking..." : isRecording ? "Stop & send" : "Send"}
                     </button>
                   </div>
                   <div className="composer-model-controls">
@@ -2616,7 +2848,14 @@ export default function App() {
                                     onClick={() => toggleExpandedMemory(memory.id)}
                                   >
                                     <span>{isExpanded ? "▾" : "▸"}</span>
-                                    {highlightMatches(memory.title, memorySearchTerms)}
+                                    {memory.title_pending ? (
+                                      <span className="memory-title-pending">
+                                        <Loader2 size={13} className="spin" />
+                                        {highlightMatches(memory.title, memorySearchTerms)}
+                                      </span>
+                                    ) : (
+                                      highlightMatches(memory.title, memorySearchTerms)
+                                    )}
                                   </button>
                                   <div className="memory-meta-row">
                                     <small className="memory-date">{formatDate(memory.created_at)}</small>
@@ -2724,7 +2963,7 @@ export default function App() {
             </header>
             <form className="settings-card model-settings-card" onSubmit={saveConfig}>
               <div className="model-settings-header">
-                <p>Save local Ollama models or external OpenAI-compatible APIs here, then tick the one to use for new chat replies.</p>
+                <p>Save local Ollama models or external OpenAI-compatible APIs here, then tick the one to use for new chat replies. Assign each model a playback voice to tell them apart when listening.</p>
                 <button type="button" onClick={openAddModelModal}>
                   <Plus size={16} />
                   Add model
@@ -2777,6 +3016,33 @@ export default function App() {
                         rows={2}
                       />
                     </label>
+                    <div className="model-row-voice">
+                      <label>
+                        Playback voice
+                        <select
+                          value={model.tts_voice_uri ?? ""}
+                          onChange={(event) => updateModelDraft(index, { tts_voice_uri: event.target.value })}
+                          disabled={!ttsVoiceOptions.length}
+                        >
+                          <option value="">Default voice (Speech settings)</option>
+                          {ttsVoiceOptions.length === 0 && <option value="">Loading voices...</option>}
+                          {ttsVoiceOptions.map((voice) => (
+                            <option key={voice.uri} value={voice.uri}>
+                              {voice.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className="speech-sample-button"
+                        onClick={() => playModelVoiceSample(model.tts_voice_uri)}
+                        disabled={!ttsVoiceOptions.length}
+                      >
+                        <Play size={16} />
+                        Play sample
+                      </button>
+                    </div>
                     <div className="model-row-timing">
                       <div>
                         <p className="model-row-timing-label">Generation timing estimate</p>
@@ -2883,7 +3149,7 @@ export default function App() {
             <form className="settings-card speech-settings-card" onSubmit={saveSpeechConfig}>
               <div>
                 <h2>Speech settings</h2>
-                <p>Choose the Whisper model for microphone input and the browser voice for assistant playback.</p>
+                <p>Choose the Whisper model for microphone input. Assign a playback voice per model above, or set a default fallback here.</p>
               </div>
 
               <label>
@@ -2902,7 +3168,7 @@ export default function App() {
 
               <div className="speech-voice-row">
                 <label>
-                  Assistant voice (text-to-speech)
+                  Default playback voice (fallback)
                   <select
                     value={selectedTtsVoiceUri}
                     onChange={(event) => handleTtsVoiceChange(event.target.value)}
@@ -2919,7 +3185,7 @@ export default function App() {
                 <button
                   type="button"
                   className="speech-sample-button"
-                  onClick={playVoiceSample}
+                  onClick={() => playVoiceSample()}
                   disabled={!ttsVoiceOptions.length}
                 >
                   <Play size={16} />
@@ -3015,7 +3281,22 @@ export default function App() {
                   >
                     {conversation.title}
                   </strong>
-                  <span>{formatDate(conversation.updated_at)}</span>
+                  <span className="conversation-select-meta">
+                    {generationJobs[conversation.id] && (
+                      <span
+                        className="conversation-generating-pill"
+                        title="Generating reply — click to view progress"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setProgressModalConversationId(conversation.id);
+                        }}
+                      >
+                        <Loader2 size={13} className="spin" />
+                        Generating
+                      </span>
+                    )}
+                    <span>{formatDate(conversation.updated_at)}</span>
+                  </span>
                 </button>
               )}
             </div>
@@ -3180,6 +3461,35 @@ export default function App() {
                   rows={3}
                 />
               </label>
+              <div className="model-row-voice add-model-voice-row">
+                <label>
+                  Playback voice
+                  <select
+                    value={addModelDraft.tts_voice_uri ?? ""}
+                    onChange={(event) =>
+                      setAddModelDraft((current) => ({ ...current, tts_voice_uri: event.target.value }))
+                    }
+                    disabled={!ttsVoiceOptions.length}
+                  >
+                    <option value="">Default voice (Speech settings)</option>
+                    {ttsVoiceOptions.length === 0 && <option value="">Loading voices...</option>}
+                    {ttsVoiceOptions.map((voice) => (
+                      <option key={voice.uri} value={voice.uri}>
+                        {voice.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  className="speech-sample-button"
+                  onClick={() => playModelVoiceSample(addModelDraft.tts_voice_uri)}
+                  disabled={!ttsVoiceOptions.length}
+                >
+                  <Play size={16} />
+                  Play sample
+                </button>
+              </div>
               <label className="model-row-api-key">
                 API key
                 <MaskedApiKeyInput
@@ -3301,7 +3611,7 @@ export default function App() {
         </div>
       )}
 
-      {llmProgressModel && (
+      {progressModalJob && (
         <div className="llm-progress-backdrop" role="status" aria-live="polite" aria-label="LLM generation in progress">
           <div className="llm-progress-card">
             <div className="llm-progress-header">
@@ -3310,98 +3620,104 @@ export default function App() {
               </div>
               <div>
                 <p>Generating with</p>
-                <strong>{llmProgressModel}</strong>
+                <strong>{progressModalJob.modelName}</strong>
+                <span className="llm-progress-provider">{progressModalJob.conversationTitle}</span>
               </div>
             </div>
 
-            {llmContextPreview ? (
+            {progressModalJob.contextPreview ? (
               <>
                 <p className="llm-context-memories">
-                  {llmContextPreview.include_memories && llmContextPreview.memory_count > 0 && (
+                  {progressModalJob.contextPreview.include_memories && progressModalJob.contextPreview.memory_count > 0 && (
                     <>
-                      Including {llmContextPreview.memory_count}{" "}
-                      {llmContextPreview.memory_count === 1 ? "memory" : "memories"} from this conversation
+                      Including {progressModalJob.contextPreview.memory_count}{" "}
+                      {progressModalJob.contextPreview.memory_count === 1 ? "memory" : "memories"} from this conversation
                     </>
                   )}
-                  {llmContextPreview.include_memories &&
-                    llmContextPreview.memory_count > 0 &&
-                    llmContextPreview.include_all_memories &&
-                    llmContextPreview.all_memory_count > 0 &&
+                  {progressModalJob.contextPreview.include_memories &&
+                    progressModalJob.contextPreview.memory_count > 0 &&
+                    progressModalJob.contextPreview.include_all_memories &&
+                    progressModalJob.contextPreview.all_memory_count > 0 &&
                     " · "}
-                  {llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0 && (
+                  {progressModalJob.contextPreview.include_all_memories && progressModalJob.contextPreview.all_memory_count > 0 && (
                     <>
-                      Including {llmContextPreview.all_memory_count} user{" "}
-                      {llmContextPreview.all_memory_count === 1 ? "memory" : "memories"} from other conversations
+                      Including {progressModalJob.contextPreview.all_memory_count} user{" "}
+                      {progressModalJob.contextPreview.all_memory_count === 1 ? "memory" : "memories"} from other conversations
                     </>
                   )}
-                  {!llmContextPreview.include_memories &&
-                    !(llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0) &&
+                  {!progressModalJob.contextPreview.include_memories &&
+                    !(progressModalJob.contextPreview.include_all_memories && progressModalJob.contextPreview.all_memory_count > 0) &&
                     "No memories included"}
                 </p>
                 <dl className="llm-context-stats">
                   <div>
                     <dt>Messages</dt>
-                    <dd>{llmContextPreview.items.length}</dd>
+                    <dd>{progressModalJob.contextPreview.items.length}</dd>
                   </div>
                   <div>
                     <dt>Memories</dt>
                     <dd>
-                      {llmContextPreview.memory_count}
-                      {llmContextPreview.include_all_memories && llmContextPreview.all_memory_count > 0
-                        ? ` + ${llmContextPreview.all_memory_count} other`
+                      {progressModalJob.contextPreview.memory_count}
+                      {progressModalJob.contextPreview.include_all_memories && progressModalJob.contextPreview.all_memory_count > 0
+                        ? ` + ${progressModalJob.contextPreview.all_memory_count} other`
                         : ""}
                     </dd>
                   </div>
                   <div>
                     <dt>Images</dt>
-                    <dd>{llmContextPreview.image_count}</dd>
+                    <dd>{progressModalJob.contextPreview.image_count}</dd>
                   </div>
                   <div>
                     <dt>Characters</dt>
-                    <dd>{llmContextPreview.total_chars.toLocaleString()}</dd>
+                    <dd>{progressModalJob.contextPreview.total_chars.toLocaleString()}</dd>
                   </div>
                 </dl>
-                {sending && llmContextPreview.generation_estimate_sec != null && (
+                {progressModalJob.contextPreview.generation_estimate_sec != null && (
                   <div className="llm-progress-estimate">
                     <div
                       className="llm-progress-bar"
                       role="progressbar"
                       aria-valuemin={0}
                       aria-valuemax={100}
-                      aria-valuenow={Math.round(generationProgressPercent(generationElapsedSec, llmContextPreview.generation_estimate_sec) ?? 0)}
+                      aria-valuenow={Math.round(
+                        generationProgressPercent(
+                          progressModalElapsedSec,
+                          progressModalJob.contextPreview.generation_estimate_sec,
+                        ) ?? 0,
+                      )}
                       aria-label="Estimated generation progress"
                     >
                       <div
                         className="llm-progress-bar-fill"
                         style={{
-                          width: `${generationProgressPercent(generationElapsedSec, llmContextPreview.generation_estimate_sec) ?? 0}%`,
+                          width: `${generationProgressPercent(progressModalElapsedSec, progressModalJob.contextPreview.generation_estimate_sec) ?? 0}%`,
                         }}
                       />
                     </div>
                     <div className="llm-progress-timing">
                       <span>
-                        Elapsed: <strong>{formatDurationSeconds(generationElapsedSec)}</strong>
+                        Elapsed: <strong>{formatDurationSeconds(progressModalElapsedSec)}</strong>
                       </span>
                       <span>
                         Predicted:{" "}
-                        <strong>{formatDurationSeconds(llmContextPreview.generation_estimate_sec)}</strong>
+                        <strong>{formatDurationSeconds(progressModalJob.contextPreview.generation_estimate_sec)}</strong>
                       </span>
                       <span>
                         Remaining:{" "}
                         <strong>
                           {formatDurationSeconds(
-                            Math.max(0, llmContextPreview.generation_estimate_sec - generationElapsedSec),
+                            Math.max(0, progressModalJob.contextPreview.generation_estimate_sec - progressModalElapsedSec),
                           )}
                         </strong>
                       </span>
                     </div>
-                    {llmContextPreview.generation_sample_count != null &&
-                      llmContextPreview.generation_sample_count > 0 &&
-                      llmContextPreview.seconds_per_char != null && (
+                    {progressModalJob.contextPreview.generation_sample_count != null &&
+                      progressModalJob.contextPreview.generation_sample_count > 0 &&
+                      progressModalJob.contextPreview.seconds_per_char != null && (
                         <p className="llm-progress-rate">
-                          Based on {llmContextPreview.generation_sample_count} previous request
-                          {llmContextPreview.generation_sample_count === 1 ? "" : "s"} (
-                          {(llmContextPreview.seconds_per_char * 1000).toFixed(2)} ms/char)
+                          Based on {progressModalJob.contextPreview.generation_sample_count} previous request
+                          {progressModalJob.contextPreview.generation_sample_count === 1 ? "" : "s"} (
+                          {(progressModalJob.contextPreview.seconds_per_char * 1000).toFixed(2)} ms/char)
                         </p>
                       )}
                   </div>
@@ -3411,18 +3727,60 @@ export default function App() {
               <p className="llm-context-loading">Loading request preview...</p>
             )}
 
-            {sending && (
-              <div className="llm-progress-footer">
-                {llmContextPreview?.generation_estimate_sec == null && (
-                  <span className="llm-progress-timer" aria-live="polite">
-                    Elapsed: {formatDurationSeconds(generationElapsedSec)}
-                  </span>
-                )}
-                <button type="button" className="secondary-button llm-progress-cancel" onClick={cancelGeneration}>
-                  Cancel
-                </button>
-              </div>
-            )}
+            <div className="llm-progress-footer">
+              {progressModalJob.contextPreview?.generation_estimate_sec == null && (
+                <span className="llm-progress-timer" aria-live="polite">
+                  Elapsed: {formatDurationSeconds(progressModalElapsedSec)}
+                </span>
+              )}
+              <button
+                type="button"
+                className="secondary-button llm-progress-background"
+                onClick={dismissProgressModal}
+              >
+                Work in background
+              </button>
+              <button
+                type="button"
+                className="secondary-button llm-progress-cancel"
+                onClick={() => cancelGeneration(progressModalJob.conversationId)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {completedGenerationAlert && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="generation-complete-title"
+          onMouseDown={() => setCompletedGenerationAlert(null)}
+        >
+          <div className="modal-card generation-complete-modal" onMouseDown={(event) => event.stopPropagation()}>
+            <div className={`generation-complete-icon ${completedGenerationAlert.error ? "generation-complete-icon-error" : ""}`}>
+              {completedGenerationAlert.error ? <X size={28} /> : <Check size={28} />}
+            </div>
+            <div>
+              <p className="eyebrow">{completedGenerationAlert.error ? "Generation failed" : "Reply ready"}</p>
+              <h2 id="generation-complete-title">{completedGenerationAlert.title}</h2>
+            </div>
+            <p className="modal-copy">
+              {completedGenerationAlert.error
+                ? completedGenerationAlert.error
+                : "The assistant finished generating a reply while you were in another conversation."}
+            </p>
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={() => setCompletedGenerationAlert(null)}>
+                Dismiss
+              </button>
+              <button type="button" onClick={() => void goToCompletedAnswer()}>
+                {completedGenerationAlert.error ? "Go to conversation" : "Go to answer"}
+              </button>
+            </div>
           </div>
         </div>
       )}

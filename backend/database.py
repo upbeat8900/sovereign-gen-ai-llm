@@ -152,7 +152,10 @@ def init_db() -> None:
         _ensure_column(connection, "memories", "llm_model", "TEXT")
         _ensure_column(connection, "memories", "archived_at", "TEXT")
         _ensure_column(connection, "llm_models", "comments", "TEXT")
+        _ensure_column(connection, "llm_models", "tts_voice_uri", "TEXT")
         _backfill_memory_titles(connection)
+        _ensure_column(connection, "memories", "title_generated_at", "TEXT")
+        _backfill_memory_title_generated_at(connection)
         connection.execute(
             """
             INSERT OR IGNORE INTO llm_config (id, provider, base_url, model, api_key)
@@ -194,6 +197,16 @@ def _backfill_memory_titles(connection: sqlite3.Connection) -> None:
             "UPDATE memories SET title = ? WHERE id = ?",
             (generate_memory_title(row["content"]), row["id"]),
         )
+
+
+def _backfill_memory_title_generated_at(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        UPDATE memories
+        SET title_generated_at = created_at
+        WHERE title_generated_at IS NULL
+        """
+    )
 
 
 def _backfill_conversation_order(connection: sqlite3.Connection) -> None:

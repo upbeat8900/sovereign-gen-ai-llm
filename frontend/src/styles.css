@@ -946,6 +946,28 @@ button:disabled {
   margin-top: 6px;
 }
 
+.conversation-select-meta {
+  align-items: center;
+  display: flex !important;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.conversation-generating-pill {
+  align-items: center;
+  background: rgba(124, 58, 237, 0.18);
+  border-radius: 999px;
+  color: #c4b5fd;
+  cursor: pointer;
+  display: inline-flex !important;
+  font-size: 11px !important;
+  font-weight: 700;
+  gap: 5px;
+  margin-top: 0 !important;
+  padding: 2px 8px;
+}
+
 .conversation-list .conversation-active {
   border-color: #60a5fa;
   box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18);
@@ -1218,6 +1240,12 @@ button:disabled {
   width: 100%;
 }
 
+.memory-title-pending {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+}
+
 .memory-content {
   margin-top: 8px;
   width: 100%;
@@ -1452,6 +1480,22 @@ button:disabled {
 
 .model-row-comments {
   grid-column: 1 / -1;
+}
+
+.model-row-voice {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  grid-column: 1 / -1;
+}
+
+.model-row-voice label {
+  flex: 1 1 260px;
+}
+
+.add-model-voice-row {
+  margin-top: 4px;
 }
 
 .model-row-timing {
@@ -1835,6 +1879,7 @@ button:disabled {
   align-items: center;
   border-top: 1px solid #e2e8f0;
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   justify-content: flex-end;
   padding-top: 4px;
@@ -1842,14 +1887,42 @@ button:disabled {
 
 .llm-progress-timer {
   color: #475569;
+  flex: 1 1 auto;
   font-size: 15px;
   font-variant-numeric: tabular-nums;
   font-weight: 800;
   letter-spacing: 0.02em;
+  min-width: 140px;
 }
 
+.llm-progress-background,
 .llm-progress-cancel {
   min-width: 96px;
+}
+
+.generation-complete-modal {
+  max-width: min(480px, 100%);
+}
+
+.generation-complete-icon {
+  align-items: center;
+  background: #dcfce7;
+  border-radius: 999px;
+  color: #16a34a;
+  display: flex;
+  height: 56px;
+  justify-content: center;
+  margin: 0 auto;
+  width: 56px;
+}
+
+.generation-complete-icon-error {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.modal-card.generation-complete-modal .modal-actions {
+  justify-content: center;
 }
 
 @keyframes brain-float {
