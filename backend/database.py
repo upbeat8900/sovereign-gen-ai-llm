@@ -136,6 +136,28 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(provider, model)
             );
+
+            CREATE TABLE IF NOT EXISTS conversation_participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                llm_model_id INTEGER NOT NULL,
+                personality TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (llm_model_id) REFERENCES llm_models(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                personality TEXT NOT NULL DEFAULT '',
+                llm_model_id INTEGER NOT NULL,
+                tts_voice_uri TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (llm_model_id) REFERENCES llm_models(id)
+            );
             """
         )
         _ensure_column(connection, "conversations", "sort_order", "INTEGER")
@@ -147,6 +169,12 @@ def init_db() -> None:
         _ensure_column(connection, "messages", "image_data", "TEXT")
         _ensure_column(connection, "messages", "generation_ms", "INTEGER")
         _ensure_column(connection, "messages", "include_history", "INTEGER")
+        _ensure_column(connection, "messages", "participant_id", "INTEGER")
+        _ensure_column(connection, "conversation_participants", "name", "TEXT")
+        _ensure_column(connection, "conversation_participants", "tts_voice_uri", "TEXT")
+        _ensure_column(connection, "conversation_participants", "agent_profile_id", "INTEGER")
+        _ensure_column(connection, "conversation_participants", "tts_speech_rate", "REAL")
+        _ensure_column(connection, "agent_profiles", "tts_speech_rate", "REAL")
         _ensure_column(connection, "memories", "title", "TEXT")
         _ensure_column(connection, "memories", "llm_provider", "TEXT")
         _ensure_column(connection, "memories", "llm_model", "TEXT")

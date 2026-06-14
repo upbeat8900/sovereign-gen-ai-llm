@@ -1,4 +1,4 @@
-import { ChangeEvent, ClipboardEvent, FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, ClipboardEvent, FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, useEffect, useState, useMemo, useRef } from "react";
 import "katex/dist/katex.min.css";
 import rehypeKatex from "rehype-katex";
 import ReactMarkdown from "react-markdown";
@@ -35,6 +35,7 @@ import {
 
 
 type Page = "chat" | "memories" | "settings";
+type SettingsTab = "models" | "agents" | "prompt" | "speech";
 type ConversationSortMode = "custom" | "recent" | "alphabetical";
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkMath];
 const MARKDOWN_REHYPE_PLUGINS = [rehypeKatex];
@@ -44,8 +45,55 @@ type Conversation = {
   title: string;
   sort_order: number;
   llm_model_id?: number | null;
+  participant_count?: number;
   created_at: string;
   updated_at: string;
+};
+
+type ConversationParticipant = {
+  id: number;
+  conversation_id: number;
+  llm_model_id: number;
+  personality: string;
+  name: string;
+  sort_order: number;
+  tts_voice_uri?: string | null;
+  tts_speech_rate?: number | null;
+  agent_profile_id?: number | null;
+  llm_provider?: string | null;
+  llm_model?: string | null;
+  llm_comments?: string | null;
+};
+
+type AgentProfile = {
+  id: number;
+  name: string;
+  personality: string;
+  llm_model_id: number;
+  tts_voice_uri?: string | null;
+  tts_speech_rate?: number | null;
+  llm_provider?: string | null;
+  llm_model?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ParticipantDraft = {
+  llm_model_id: number;
+  personality: string;
+  name: string;
+  tts_voice_uri?: string;
+  tts_speech_rate?: number | null;
+  agent_profile_id?: number | null;
+};
+
+type ConversationParticipantPayload = {
+  llm_model_id: number;
+  personality: string;
+  name: string;
+  tts_voice_uri: string | null;
+  tts_speech_rate: number | null;
+  agent_profile_id: number | null;
 };
 
 type Message = {
@@ -59,6 +107,7 @@ type Message = {
   llm_model?: string | null;
   generation_ms?: number | null;
   include_history?: boolean | number | null;
+  participant_id?: number | null;
   created_at: string;
 };
 
@@ -86,6 +135,7 @@ type ConversationDetail = {
   conversation: Conversation;
   messages: Message[];
   memories: Memory[];
+  participants: ConversationParticipant[];
 };
 
 type MemoryGroup = {
@@ -161,6 +211,11 @@ const HISTORY_MESSAGE_LIMIT_STORAGE_KEY = "chat_history_message_limit";
 const INCLUDE_MEMORIES_STORAGE_KEY = "chat_include_memories";
 const INCLUDE_ALL_MEMORIES_STORAGE_KEY = "chat_include_all_memories";
 const CONVERSATION_SORT_STORAGE_KEY = "chat_conversation_sort";
+const DISCUSSION_ROUNDS_STORAGE_KEY = "chat_discussion_rounds";
+const ANSWER_LENGTH_STORAGE_KEY = "chat_answer_length";
+const ANSWER_LENGTH_MIN = 1;
+const ANSWER_LENGTH_MAX = 5;
+const ANSWER_LENGTH_LABELS = ["1 sent.", "2–3 sent.", "3–4 sent.", "4–5 sent.", "Auto"];
 const HISTORY_FULL_SENTINEL = -1;
 const LLM_HISTORY_DB_CAP = 40;
 
@@ -612,6 +667,27 @@ function persistTtsSpeechRate(rate: number): number {
   return clamped;
 }
 
+function clampTtsSpeechRate(rate: number): number {
+  return Math.min(TTS_RATE_MAX, Math.max(TTS_RATE_MIN, rate));
+}
+
+function resolveTtsSpeechRateForParticipant(participant: ConversationParticipant | ParticipantDraft): number {
+  if (participant.tts_speech_rate != null && Number.isFinite(participant.tts_speech_rate)) {
+    return clampTtsSpeechRate(participant.tts_speech_rate);
+  }
+  return readStoredTtsSpeechRate();
+}
+
+function resolveTtsSpeechRateForMessage(message: Message, participants: ConversationParticipant[]): number {
+  if (message.participant_id != null) {
+    const participant = participants.find((item) => item.id === message.participant_id);
+    if (participant) {
+      return resolveTtsSpeechRateForParticipant(participant);
+    }
+  }
+  return readStoredTtsSpeechRate();
+}
+
 function formatDate(value: string) {
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
@@ -647,7 +723,80 @@ type LlmContextPreview = {
   generation_estimate_sec?: number | null;
   seconds_per_char?: number | null;
   generation_sample_count?: number;
+  multi_agent_note?: string | null;
 };
+
+function readStoredDiscussionRounds(): number {
+  const stored = localStorage.getItem(DISCUSSION_ROUNDS_STORAGE_KEY);
+  if (stored !== null) {
+    const parsed = Number(stored);
+    if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 10) {
+      return Math.round(parsed);
+    }
+  }
+  return 1;
+}
+
+function readStoredAnswerLength(): number {
+  const stored = localStorage.getItem(ANSWER_LENGTH_STORAGE_KEY);
+  if (stored !== null) {
+    const parsed = Number(stored);
+    if (Number.isFinite(parsed) && parsed >= ANSWER_LENGTH_MIN && parsed <= ANSWER_LENGTH_MAX) {
+      return Math.round(parsed);
+    }
+  }
+  return 3;
+}
+
+function answerLengthLabel(level: number) {
+  return ANSWER_LENGTH_LABELS[Math.max(0, Math.min(ANSWER_LENGTH_LABELS.length - 1, level - 1))];
+}
+
+function createParticipantDraft(models: LlmModel[], index = 0): ParticipantDraft {
+  const model = models[index]?.id != null ? models[index] : models[0];
+  return {
+    llm_model_id: model?.id ?? 0,
+    personality: "",
+    name: "",
+    tts_voice_uri: "",
+    agent_profile_id: null,
+  };
+}
+
+function participantDraftFromProfile(profile: AgentProfile): ParticipantDraft {
+  return {
+    agent_profile_id: profile.id,
+    name: profile.name,
+    llm_model_id: profile.llm_model_id,
+    personality: profile.personality,
+    tts_voice_uri: profile.tts_voice_uri ?? "",
+    tts_speech_rate: profile.tts_speech_rate ?? null,
+  };
+}
+
+function participantDisplayName(participant: ConversationParticipant | ParticipantDraft, models: LlmModel[]) {
+  if (participant.name?.trim()) {
+    return participant.name.trim();
+  }
+  if ("llm_model" in participant && participant.llm_model) {
+    const comments = participant.llm_comments?.trim();
+    if (comments) return comments;
+    return participant.llm_model;
+  }
+  const model = models.find((item) => item.id === participant.llm_model_id);
+  if (model?.comments?.trim()) return model.comments.trim();
+  return model?.model ?? "Agent";
+}
+
+function messageSpeakerLabel(message: Message, participants: ConversationParticipant[], models: LlmModel[]) {
+  if (message.role !== "assistant") return "You";
+  if (message.participant_id != null) {
+    const participant = participants.find((item) => item.id === message.participant_id);
+    if (participant) return participantDisplayName(participant, models);
+  }
+  if (message.llm_model) return message.llm_model;
+  return "Assistant";
+}
 
 function assistantUsedCurrentMessageOnly(message: Message) {
   return message.include_history === false || message.include_history === 0;
@@ -688,6 +837,13 @@ type GenerationJob = {
   modelName: string;
   contextPreview: LlmContextPreview | null;
   startedAt: number;
+  isMultiAgent?: boolean;
+  totalSteps?: number;
+  completedSteps?: number;
+  currentParticipantName?: string;
+  initialMessageCount?: number;
+  speakReplies?: boolean;
+  autoPlayReplies?: boolean;
 };
 
 type CompletedGenerationAlert = {
@@ -695,6 +851,306 @@ type CompletedGenerationAlert = {
   title: string;
   error?: string;
 };
+
+function participantModelLabel(participant: ParticipantDraft, models: LlmModel[]) {
+  const model = models.find((item) => item.id === participant.llm_model_id);
+  return model ? `${model.model} (${model.provider})` : "No model selected";
+}
+
+function AgentProfileFields({
+  draft,
+  onChange,
+  models,
+  ttsVoiceOptions,
+  onPlayVoiceSample,
+}: {
+  draft: ParticipantDraft;
+  onChange: (patch: Partial<ParticipantDraft>) => void;
+  models: LlmModel[];
+  ttsVoiceOptions: TtsVoiceOption[];
+  onPlayVoiceSample: (voiceUri?: string, speechRate?: number) => void;
+}) {
+  return (
+    <div className="agent-profile-form">
+      <label>
+        Name
+        <input
+          value={draft.name}
+          placeholder="e.g. Optimist, Devil's advocate"
+          onChange={(event) => onChange({ name: event.target.value })}
+        />
+      </label>
+      <label>
+        Model
+        <select
+          value={draft.llm_model_id}
+          onChange={(event) => onChange({ llm_model_id: Number(event.target.value) })}
+        >
+          {models.map((model) => (
+            <option key={model.id} value={model.id}>
+              {model.model} ({model.provider})
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="participant-voice-row">
+        <label>
+          Playback voice
+          <select
+            value={draft.tts_voice_uri ?? ""}
+            onChange={(event) => onChange({ tts_voice_uri: event.target.value })}
+            disabled={!ttsVoiceOptions.length}
+          >
+            <option value="">Default voice (model or Speech settings)</option>
+            {ttsVoiceOptions.map((voice) => (
+              <option key={voice.uri} value={voice.uri}>
+                {voice.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          className="speech-sample-button"
+          onClick={() => onPlayVoiceSample(draft.tts_voice_uri, resolveTtsSpeechRateForParticipant(draft))}
+          disabled={!ttsVoiceOptions.length}
+        >
+          <Play size={16} />
+          Sample
+        </button>
+      </div>
+      <div className="participant-speech-rate-row">
+        <label className="participant-speech-rate">
+          <span>Speech speed</span>
+          <span className="participant-speech-rate-controls">
+            <input
+              type="range"
+              min={TTS_RATE_MIN}
+              max={TTS_RATE_MAX}
+              step={0.05}
+              value={draft.tts_speech_rate ?? readStoredTtsSpeechRate()}
+              disabled={draft.tts_speech_rate == null}
+              onInput={(event) => onChange({ tts_speech_rate: Number(event.currentTarget.value) })}
+            />
+            <span className="participant-speech-rate-value">
+              {draft.tts_speech_rate == null
+                ? `Global (${readStoredTtsSpeechRate().toFixed(1)}×)`
+                : `${draft.tts_speech_rate.toFixed(1)}×`}
+            </span>
+          </span>
+        </label>
+        <label className="participant-global-rate-toggle">
+          <input
+            type="checkbox"
+            checked={draft.tts_speech_rate == null}
+            onChange={(event) =>
+              onChange({
+                tts_speech_rate: event.target.checked ? null : readStoredTtsSpeechRate(),
+              })
+            }
+          />
+          Use global speed
+        </label>
+      </div>
+      <label>
+        Personality / perspective
+        <textarea
+          rows={4}
+          value={draft.personality}
+          placeholder={`Optional vision for ${participantDisplayName(draft, models)}`}
+          onChange={(event) => onChange({ personality: event.target.value })}
+        />
+      </label>
+    </div>
+  );
+}
+
+function ParticipantEditor({
+  participants,
+  onChange,
+  models,
+  agentProfiles,
+  ttsVoiceOptions,
+  onSaveProfile,
+  onUpdateProfile,
+  onPlayVoiceSample,
+  savingProfileIndex,
+}: {
+  participants: ParticipantDraft[];
+  onChange: (next: ParticipantDraft[]) => void;
+  models: LlmModel[];
+  agentProfiles: AgentProfile[];
+  ttsVoiceOptions: TtsVoiceOption[];
+  onSaveProfile: (index: number) => void | Promise<void>;
+  onUpdateProfile: (index: number) => void | Promise<void>;
+  onPlayVoiceSample: (voiceUri?: string, speechRate?: number) => void;
+  savingProfileIndex?: number | null;
+}) {
+  const [expandedIndex, setExpandedIndex] = useState(0);
+
+  useEffect(() => {
+    setExpandedIndex((current) => Math.min(current, Math.max(0, participants.length - 1)));
+  }, [participants.length]);
+
+  function updateParticipant(index: number, patch: Partial<ParticipantDraft>) {
+    onChange(participants.map((participant, i) => (i === index ? { ...participant, ...patch } : participant)));
+  }
+
+  function applySavedAgent(index: number, profileId: number | null) {
+    if (!profileId) {
+      updateParticipant(index, { agent_profile_id: null });
+      return;
+    }
+    const profile = agentProfiles.find((item) => item.id === profileId);
+    if (profile) {
+      onChange(participants.map((participant, i) => (i === index ? participantDraftFromProfile(profile) : participant)));
+      setExpandedIndex(index);
+    }
+  }
+
+  function addParticipant() {
+    if (participants.length >= 3) return;
+    onChange([...participants, createParticipantDraft(models, participants.length)]);
+    setExpandedIndex(participants.length);
+  }
+
+  function removeParticipant(index: number) {
+    if (participants.length <= 1) return;
+    onChange(participants.filter((_, i) => i !== index));
+    setExpandedIndex((current) => {
+      if (current === index) return Math.max(0, index - 1);
+      if (current > index) return current - 1;
+      return current;
+    });
+  }
+
+  function selectParticipant(index: number) {
+    setExpandedIndex(index);
+  }
+
+  return (
+    <div className="participant-editor">
+      <div className="participant-editor-scroll">
+        {participants.map((participant, index) => {
+          const isExpanded = expandedIndex === index;
+          const displayName = participant.name.trim() || `Agent ${index + 1}`;
+          const modelLabel = participantModelLabel(participant, models);
+          const personalityPreview = participant.personality.trim();
+          return (
+            <section
+              className={`participant-editor-row ${isExpanded ? "is-expanded" : "is-collapsed"}`}
+              key={index}
+            >
+              <div className="participant-editor-row-header">
+                <button
+                  type="button"
+                  className="participant-editor-toggle"
+                  aria-expanded={isExpanded}
+                  onClick={() => selectParticipant(index)}
+                >
+                  <ChevronRight size={18} className="participant-editor-chevron" />
+                  <span className="participant-editor-toggle-text">
+                    <strong>{displayName}</strong>
+                    {!isExpanded && (
+                      <span className="participant-editor-summary">
+                        {modelLabel}
+                        {personalityPreview ? ` · ${personalityPreview.slice(0, 48)}${personalityPreview.length > 48 ? "…" : ""}` : ""}
+                      </span>
+                    )}
+                  </span>
+                </button>
+                {participants.length > 1 && (
+                  <button
+                    type="button"
+                    className="secondary-button participant-remove"
+                    onClick={() => removeParticipant(index)}
+                  >
+                    Remove
+                  </button>
+                )}
+              </div>
+              {isExpanded && (
+                <div className="participant-editor-body">
+                  <label>
+                    Saved agent
+                    <select
+                      value={participant.agent_profile_id ?? ""}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        applySavedAgent(index, value ? Number(value) : null);
+                      }}
+                    >
+                      <option value="">Custom agent</option>
+                      {agentProfiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <AgentProfileFields
+                    draft={participant}
+                    onChange={(patch) => updateParticipant(index, patch)}
+                    models={models}
+                    ttsVoiceOptions={ttsVoiceOptions}
+                    onPlayVoiceSample={onPlayVoiceSample}
+                  />
+                  <div className="participant-library-actions">
+                    {participant.agent_profile_id ? (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={savingProfileIndex === index || !participant.name.trim()}
+                        onClick={() => void onUpdateProfile(index)}
+                      >
+                        {savingProfileIndex === index ? (
+                          <>
+                            <Loader2 size={16} className="spin" />
+                            Updating...
+                          </>
+                        ) : (
+                          <>
+                            <Save size={16} />
+                            Update library
+                          </>
+                        )}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={savingProfileIndex === index || !participant.name.trim()}
+                        onClick={() => void onSaveProfile(index)}
+                      >
+                        {savingProfileIndex === index ? (
+                          <>
+                            <Loader2 size={16} className="spin" />
+                            Saving...
+                          </>
+                        ) : (
+                          <>
+                            <Save size={16} />
+                            Save to library
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </section>
+          );
+        })}
+      </div>
+      {participants.length < 3 && (
+        <button type="button" className="secondary-button participant-add" onClick={addParticipant}>
+          <Plus size={16} />
+          Add agent
+        </button>
+      )}
+    </div>
+  );
+}
 
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
@@ -711,6 +1167,19 @@ export default function App() {
   const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
   const [newTitle, setNewTitle] = useState("");
   const [isNewConversationModalOpen, setIsNewConversationModalOpen] = useState(false);
+  const [newConversationMode, setNewConversationMode] = useState<"single" | "multi">("single");
+  const [newConversationParticipants, setNewConversationParticipants] = useState<ParticipantDraft[]>([]);
+  const [isParticipantsModalOpen, setIsParticipantsModalOpen] = useState(false);
+  const [participantsDraft, setParticipantsDraft] = useState<ParticipantDraft[]>([]);
+  const [savingParticipants, setSavingParticipants] = useState(false);
+  const [agentProfiles, setAgentProfiles] = useState<AgentProfile[]>([]);
+  const [savingAgentProfileIndex, setSavingAgentProfileIndex] = useState<number | null>(null);
+  const [editingAgentProfile, setEditingAgentProfile] = useState<AgentProfile | null>(null);
+  const [agentProfileEditDraft, setAgentProfileEditDraft] = useState<ParticipantDraft | null>(null);
+  const [savingAgentProfileEdit, setSavingAgentProfileEdit] = useState(false);
+  const [participantEditorTarget, setParticipantEditorTarget] = useState<"new" | "edit">("new");
+  const [discussionRounds, setDiscussionRounds] = useState(readStoredDiscussionRounds);
+  const [answerLength, setAnswerLength] = useState(readStoredAnswerLength);
   const [deleteConversationTarget, setDeleteConversationTarget] = useState<Conversation | null>(null);
   const [deleteMessageCount, setDeleteMessageCount] = useState(0);
   const [deleteMemoryCount, setDeleteMemoryCount] = useState(0);
@@ -742,6 +1211,7 @@ export default function App() {
   const [mergeText, setMergeText] = useState("");
   const [config, setConfig] = useState<LlmConfig | null>(null);
   const [configDraft, setConfigDraft] = useState<LlmModel[]>([]);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("models");
   const [isAddModelModalOpen, setIsAddModelModalOpen] = useState(false);
   const [addModelDraft, setAddModelDraft] = useState<LlmModel>(() => createAddModelDraft(true));
   const [resettingTimingModelId, setResettingTimingModelId] = useState<number | null>(null);
@@ -767,10 +1237,20 @@ export default function App() {
   const mediaChunksRef = useRef<Blob[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const speakingMessageIdRef = useRef<number | null>(null);
-  const speakingPlaybackRef = useRef<{ id: number | "sample"; content: string; voiceUri?: string } | null>(null);
+  const speakingPlaybackRef = useRef<{
+    id: number | "sample";
+    content: string;
+    voiceUri?: string;
+    speechRate?: number;
+  } | null>(null);
   const playbackSessionRef = useRef(0);
+  const speechQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const spokenMessageIdsByConversationRef = useRef<Record<number, Set<number>>>({});
+  const speakRepliesByConversationRef = useRef<Record<number, boolean>>({});
+  const speakReplyStartIndexByConversationRef = useRef<Record<number, number>>({});
   const generationAbortByConversationRef = useRef(new Map<number, AbortController>());
   const activeIdRef = useRef<number | null>(null);
+  const generationJobsRef = useRef<Record<number, GenerationJob>>({});
   const editingConversationIdRef = useRef<number | null>(null);
   const speechSelectionRef = useRef<{ messageId: number; text: string } | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -872,6 +1352,8 @@ export default function App() {
     return config?.models.find((model) => model.id === modelId) ?? config?.active_model ?? null;
   }, [config, detail?.conversation.llm_model_id]);
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
+  const activeParticipants = detail?.participants ?? [];
+  const isMultiAgentConversation = activeParticipants.length > 0;
   const activeConversationGenerating = activeId != null && activeId in generationJobs;
   const progressModalJob =
     progressModalConversationId != null ? generationJobs[progressModalConversationId] ?? null : null;
@@ -946,10 +1428,17 @@ export default function App() {
     persistIncludeAllMemories(next);
   }
 
+  function updateAnswerLength(next: number) {
+    const clamped = Math.max(ANSWER_LENGTH_MIN, Math.min(ANSWER_LENGTH_MAX, Math.round(next)));
+    setAnswerLength(clamped);
+    localStorage.setItem(ANSWER_LENGTH_STORAGE_KEY, String(clamped));
+  }
+
   useEffect(() => {
     loadConversations();
     loadMemoryGroups();
     loadConfig();
+    void loadAgentProfiles();
     setTtsSpeechRate(readStoredTtsSpeechRate());
   }, []);
 
@@ -987,6 +1476,10 @@ export default function App() {
   }, [activeId]);
 
   useEffect(() => {
+    generationJobsRef.current = generationJobs;
+  }, [generationJobs]);
+
+  useEffect(() => {
     editingConversationIdRef.current = editingConversationId;
   }, [editingConversationId]);
 
@@ -995,6 +1488,31 @@ export default function App() {
     const intervalId = window.setInterval(() => setGenerationClock(Date.now()), 1000);
     return () => window.clearInterval(intervalId);
   }, [generationJobs]);
+
+  useEffect(() => {
+    if (!Object.values(generationJobs).some((job) => job.isMultiAgent)) return;
+    const pollGeneratingConversations = () => {
+      Object.values(generationJobsRef.current)
+        .filter((job) => job.isMultiAgent)
+        .forEach((job) => {
+          void loadConversation(job.conversationId);
+        });
+    };
+    pollGeneratingConversations();
+    const intervalId = window.setInterval(pollGeneratingConversations, 800);
+    return () => window.clearInterval(intervalId);
+  }, [generationJobs]);
+
+  useEffect(() => {
+    if (
+      isNewConversationModalOpen &&
+      newConversationMode === "multi" &&
+      config?.models.length &&
+      !newConversationParticipants.length
+    ) {
+      setNewConversationParticipants([createParticipantDraft(config.models)]);
+    }
+  }, [isNewConversationModalOpen, newConversationMode, config, newConversationParticipants.length]);
 
   useEffect(() => {
     if (page === "settings") {
@@ -1136,10 +1654,111 @@ export default function App() {
 
   function stopSpeechPlayback() {
     playbackSessionRef.current += 1;
+    speechQueueRef.current = Promise.resolve();
     window.speechSynthesis?.cancel();
     speakingMessageIdRef.current = null;
     speakingPlaybackRef.current = null;
     setSpeakingMessageId(null);
+  }
+
+  function speakTextAsync(content: string, messageId: number, voiceUri?: string, speechRate?: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (!window.speechSynthesis) {
+        resolve();
+        return;
+      }
+      const plain = content.trim();
+      if (!plain) {
+        resolve();
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+      const session = ++playbackSessionRef.current;
+      const utterance = new SpeechSynthesisUtterance(plain);
+      const resolvedVoiceUri = voiceUri || resolveDefaultTtsVoiceUri();
+      const resolvedSpeechRate = speechRate ?? readStoredTtsSpeechRate();
+      applyTtsVoice(utterance, resolvedVoiceUri, resolvedSpeechRate);
+
+      const finishPlayback = () => {
+        if (playbackSessionRef.current !== session) {
+          resolve();
+          return;
+        }
+        speakingPlaybackRef.current = null;
+        speakingMessageIdRef.current = null;
+        setSpeakingMessageId(null);
+        resolve();
+      };
+
+      utterance.onend = finishPlayback;
+      utterance.onerror = finishPlayback;
+
+      speakingPlaybackRef.current = {
+        id: messageId,
+        content: plain,
+        voiceUri: resolvedVoiceUri,
+        speechRate: resolvedSpeechRate,
+      };
+      speakingMessageIdRef.current = messageId;
+      setSpeakingMessageId(messageId);
+      window.speechSynthesis.speak(utterance);
+    });
+  }
+
+  function shouldAutoPlayAssistantReplies(conversationId: number) {
+    if (speakRepliesByConversationRef.current[conversationId]) {
+      return true;
+    }
+    const job = generationJobsRef.current[conversationId];
+    return Boolean(job?.isMultiAgent && job.autoPlayReplies);
+  }
+
+  function beginAssistantReplyPlayback(conversationId: number, initialMessageCount: number) {
+    spokenMessageIdsByConversationRef.current[conversationId] = new Set();
+    speakReplyStartIndexByConversationRef.current[conversationId] = initialMessageCount;
+    stopSpeechPlayback();
+  }
+
+  function enqueueAssistantSpeech(
+    conversationId: number,
+    message: Message,
+    participants: ConversationParticipant[] = activeParticipants,
+  ) {
+    if (message.id <= 0 || message.role !== "assistant" || !message.content.trim()) return;
+
+    const spoken =
+      spokenMessageIdsByConversationRef.current[conversationId] ??
+      (spokenMessageIdsByConversationRef.current[conversationId] = new Set());
+    if (spoken.has(message.id)) return;
+    spoken.add(message.id);
+
+    speechQueueRef.current = speechQueueRef.current
+      .then(async () => {
+        const plain = stripMarkdownForSpeech(message.content);
+        if (!plain) return;
+        await speakTextAsync(
+          plain,
+          message.id,
+          resolveTtsVoiceUriForMessage(message, participants, config?.models ?? []),
+          resolveTtsSpeechRateForMessage(message, participants),
+        );
+      })
+      .catch(() => {});
+  }
+
+  function maybeSpeakPendingAssistantReplies(
+    conversationId: number,
+    messages: Message[],
+    participants: ConversationParticipant[] = activeParticipants,
+  ) {
+    if (!shouldAutoPlayAssistantReplies(conversationId)) return;
+    const initialMessageCount = speakReplyStartIndexByConversationRef.current[conversationId];
+    const startIndex = initialMessageCount != null ? initialMessageCount + 1 : 0;
+    for (const message of messages.slice(startIndex)) {
+      if (message.role !== "assistant" || !message.content.trim()) continue;
+      enqueueAssistantSpeech(conversationId, message, participants);
+    }
   }
 
   function resolveDefaultTtsVoiceUri() {
@@ -1156,7 +1775,25 @@ export default function App() {
     return resolveDefaultTtsVoiceUri();
   }
 
-  function speakText(content: string, playbackId: number | "sample", voiceUri?: string) {
+  function resolveTtsVoiceUriForParticipant(participant: ConversationParticipant | ParticipantDraft, models: LlmModel[]) {
+    if (participant.tts_voice_uri?.trim()) {
+      return participant.tts_voice_uri.trim();
+    }
+    const model = models.find((entry) => entry.id === participant.llm_model_id);
+    return resolveTtsVoiceUriForModel(model?.model);
+  }
+
+  function resolveTtsVoiceUriForMessage(message: Message, participants: ConversationParticipant[], models: LlmModel[]) {
+    if (message.participant_id != null) {
+      const participant = participants.find((entry) => entry.id === message.participant_id);
+      if (participant) {
+        return resolveTtsVoiceUriForParticipant(participant, models);
+      }
+    }
+    return resolveTtsVoiceUriForModel(message.llm_model);
+  }
+
+  function speakText(content: string, playbackId: number | "sample", voiceUri?: string, speechRate?: number) {
     if (!window.speechSynthesis) return;
     const plain = content.trim();
     if (!plain) return;
@@ -1165,7 +1802,8 @@ export default function App() {
     const session = ++playbackSessionRef.current;
     const utterance = new SpeechSynthesisUtterance(plain);
     const resolvedVoiceUri = voiceUri || resolveDefaultTtsVoiceUri();
-    applyTtsVoice(utterance, resolvedVoiceUri);
+    const resolvedSpeechRate = speechRate ?? readStoredTtsSpeechRate();
+    applyTtsVoice(utterance, resolvedVoiceUri, resolvedSpeechRate);
 
     const finishPlayback = () => {
       if (playbackSessionRef.current !== session) return;
@@ -1179,7 +1817,12 @@ export default function App() {
     utterance.onend = finishPlayback;
     utterance.onerror = finishPlayback;
 
-    speakingPlaybackRef.current = { id: playbackId, content: plain, voiceUri: resolvedVoiceUri };
+    speakingPlaybackRef.current = {
+      id: playbackId,
+      content: plain,
+      voiceUri: resolvedVoiceUri,
+      speechRate: resolvedSpeechRate,
+    };
     if (typeof playbackId === "number") {
       speakingMessageIdRef.current = playbackId;
       setSpeakingMessageId(playbackId);
@@ -1190,12 +1833,12 @@ export default function App() {
     window.speechSynthesis.speak(utterance);
   }
 
-  function applyTtsVoice(utterance: SpeechSynthesisUtterance, voiceUri?: string) {
+  function applyTtsVoice(utterance: SpeechSynthesisUtterance, voiceUri?: string, speechRate?: number) {
     const voice = resolveTtsVoice(voiceUri || resolveDefaultTtsVoiceUri());
     if (voice) {
       utterance.voice = voice;
     }
-    utterance.rate = readStoredTtsSpeechRate();
+    utterance.rate = speechRate ?? readStoredTtsSpeechRate();
   }
 
   function handleTtsSpeechRateChange(rate: number) {
@@ -1204,14 +1847,19 @@ export default function App() {
 
     const current = speakingPlaybackRef.current;
     if (!current || !window.speechSynthesis?.speaking) return;
-    speakText(current.content, current.id, current.voiceUri);
+    speakText(current.content, current.id, current.voiceUri, clamped);
   }
 
   function playAssistantMessage(message: Message, selectedText?: string) {
     const selected = selectedText?.trim() || getSelectedTextInMessage(message.id);
     const plain = selected || stripMarkdownForSpeech(message.content);
     if (!plain) return;
-    speakText(plain, message.id, resolveTtsVoiceUriForModel(message.llm_model));
+    speakText(
+      plain,
+      message.id,
+      resolveTtsVoiceUriForMessage(message, activeParticipants, config?.models ?? []),
+      resolveTtsSpeechRateForMessage(message, activeParticipants),
+    );
   }
 
   function captureSpeechSelection(message: Message) {
@@ -1226,12 +1874,12 @@ export default function App() {
     playAssistantMessage(message, selected);
   }
 
-  function playVoiceSample(voiceUri?: string) {
-    speakText(TTS_SAMPLE_TEXT, "sample", voiceUri);
+  function playVoiceSample(voiceUri?: string, speechRate?: number) {
+    speakText(TTS_SAMPLE_TEXT, "sample", voiceUri, speechRate ?? readStoredTtsSpeechRate());
   }
 
-  function playModelVoiceSample(voiceUri: string | null | undefined) {
-    playVoiceSample(voiceUri || undefined);
+  function playModelVoiceSample(voiceUri: string | null | undefined, speechRate?: number) {
+    playVoiceSample(voiceUri || undefined, speechRate);
   }
 
   function handleTtsVoiceChange(voiceUri: string) {
@@ -1332,6 +1980,64 @@ export default function App() {
     setDefaultPromptDraft(baseline);
   }
 
+  function appendOptimisticUserMessage(content: string) {
+    if (!activeId) return null;
+
+    const userId = -Date.now();
+    const createdAt = createOptimisticTimestamp();
+    setDetail((current) =>
+      current && {
+        ...current,
+        messages: [
+          ...current.messages,
+          {
+            id: userId,
+            conversation_id: activeId,
+            role: "user",
+            content,
+            created_at: createdAt,
+          },
+        ],
+      },
+    );
+    requestAnimationFrame(() => {
+      const messagesEl = document.querySelector(".messages");
+      if (messagesEl) {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    });
+    return userId;
+  }
+
+  function appendOptimisticAssistantPlaceholder() {
+    if (!activeId) return null;
+
+    const assistantId = -Date.now() - 1;
+    const createdAt = createOptimisticTimestamp();
+    setDetail((current) => {
+      if (!current) return current;
+      const last = current.messages[current.messages.length - 1];
+      if (last?.role === "assistant" && !last.content && last.id < 0) {
+        return current;
+      }
+      return {
+        ...current,
+        messages: [
+          ...current.messages,
+          {
+            id: assistantId,
+            conversation_id: activeId,
+            role: "assistant",
+            content: "",
+            llm_model: activeModelName,
+            created_at: createdAt,
+          },
+        ],
+      };
+    });
+    return assistantId;
+  }
+
   function appendOptimisticExchange(content: string) {
     if (!activeId) return { userId: null, assistantId: null };
 
@@ -1381,6 +2087,27 @@ export default function App() {
     if (activeIdRef.current === conversationId) {
       setDetail(data);
     }
+    setConversations((current) =>
+      current.map((item) =>
+        item.id === conversationId
+          ? { ...item, participant_count: data.participants.length, updated_at: data.conversation.updated_at }
+          : item,
+      ),
+    );
+    const job = generationJobsRef.current[conversationId];
+    if (job?.isMultiAgent && job.initialMessageCount != null) {
+      const newAssistants = data.messages
+        .slice(job.initialMessageCount + 1)
+        .filter((message) => message.role === "assistant" && message.content.trim());
+      const completedSteps = newAssistants.length;
+      const lastAssistant = newAssistants[newAssistants.length - 1];
+      const currentParticipantName = lastAssistant
+        ? messageSpeakerLabel(lastAssistant, data.participants, config?.models ?? [])
+        : job.currentParticipantName;
+      updateGenerationJob(conversationId, { completedSteps, currentParticipantName });
+    }
+    maybeSpeakPendingAssistantReplies(conversationId, data.messages, data.participants);
+    return data;
   }
 
   function updateGenerationJob(conversationId: number, patch: Partial<GenerationJob>) {
@@ -1463,6 +2190,161 @@ export default function App() {
     );
   }
 
+  async function loadAgentProfiles() {
+    const data = await request<AgentProfile[]>("/api/agent-profiles");
+    setAgentProfiles(data);
+  }
+
+  function participantPayloadFromDraft(participant: ParticipantDraft): ConversationParticipantPayload {
+    return {
+      llm_model_id: participant.llm_model_id,
+      personality: participant.personality,
+      name: participant.name,
+      tts_voice_uri: participant.tts_voice_uri?.trim() || null,
+      tts_speech_rate: participant.tts_speech_rate ?? null,
+      agent_profile_id: participant.agent_profile_id ?? null,
+    };
+  }
+
+  function agentProfilePayloadFromDraft(participant: ParticipantDraft) {
+    return {
+      name: participant.name.trim(),
+      personality: participant.personality,
+      llm_model_id: participant.llm_model_id,
+      tts_voice_uri: participant.tts_voice_uri?.trim() || null,
+      tts_speech_rate: participant.tts_speech_rate ?? null,
+    };
+  }
+
+  function updateParticipantDraftAt(index: number, patch: Partial<ParticipantDraft>) {
+    if (participantEditorTarget === "new") {
+      setNewConversationParticipants((current) =>
+        current.map((participant, i) => (i === index ? { ...participant, ...patch } : participant)),
+      );
+      return;
+    }
+    setParticipantsDraft((current) =>
+      current.map((participant, i) => (i === index ? { ...participant, ...patch } : participant)),
+    );
+  }
+
+  async function saveAgentProfileFromDraft(index: number) {
+    const drafts = participantEditorTarget === "new" ? newConversationParticipants : participantsDraft;
+    const draft = drafts[index];
+    if (!draft?.name.trim()) {
+      setError("Agent name is required to save to the library");
+      return;
+    }
+    setSavingAgentProfileIndex(index);
+    setError("");
+    try {
+      const saved = await request<AgentProfile>("/api/agent-profiles", {
+        method: "POST",
+        body: JSON.stringify(agentProfilePayloadFromDraft(draft)),
+      });
+      setAgentProfiles((current) =>
+        [...current.filter((item) => item.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)),
+      );
+      updateParticipantDraftAt(index, { agent_profile_id: saved.id });
+      setNotice(`Saved agent "${saved.name}" to library.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save agent profile");
+    } finally {
+      setSavingAgentProfileIndex(null);
+    }
+  }
+
+  async function updateAgentProfileFromDraft(index: number) {
+    const drafts = participantEditorTarget === "new" ? newConversationParticipants : participantsDraft;
+    const draft = drafts[index];
+    if (!draft?.name.trim()) {
+      setError("Agent name is required");
+      return;
+    }
+    if (!draft.agent_profile_id) {
+      await saveAgentProfileFromDraft(index);
+      return;
+    }
+    setSavingAgentProfileIndex(index);
+    setError("");
+    try {
+      const saved = await request<AgentProfile>(`/api/agent-profiles/${draft.agent_profile_id}`, {
+        method: "PUT",
+        body: JSON.stringify(agentProfilePayloadFromDraft(draft)),
+      });
+      setAgentProfiles((current) =>
+        current
+          .map((item) => (item.id === saved.id ? saved : item))
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      );
+      setNotice(`Updated agent "${saved.name}" in library.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update agent profile");
+    } finally {
+      setSavingAgentProfileIndex(null);
+    }
+  }
+
+  async function deleteAgentProfile(profileId: number) {
+    setError("");
+    try {
+      await request(`/api/agent-profiles/${profileId}`, { method: "DELETE" });
+      setAgentProfiles((current) => current.filter((item) => item.id !== profileId));
+      setNewConversationParticipants((current) =>
+        current.map((participant) =>
+          participant.agent_profile_id === profileId ? { ...participant, agent_profile_id: null } : participant,
+        ),
+      );
+      setParticipantsDraft((current) =>
+        current.map((participant) =>
+          participant.agent_profile_id === profileId ? { ...participant, agent_profile_id: null } : participant,
+        ),
+      );
+      if (editingAgentProfile?.id === profileId) {
+        closeAgentProfileEditor();
+      }
+      setNotice("Agent removed from library.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete agent profile");
+    }
+  }
+
+  function openAgentProfileEditor(profile: AgentProfile) {
+    setEditingAgentProfile(profile);
+    setAgentProfileEditDraft(participantDraftFromProfile(profile));
+    setError("");
+  }
+
+  function closeAgentProfileEditor() {
+    setEditingAgentProfile(null);
+    setAgentProfileEditDraft(null);
+  }
+
+  async function saveAgentProfileEdit(event?: FormEvent) {
+    event?.preventDefault();
+    if (!editingAgentProfile || !agentProfileEditDraft?.name.trim()) {
+      setError("Agent name is required");
+      return;
+    }
+    setSavingAgentProfileEdit(true);
+    setError("");
+    try {
+      const saved = await request<AgentProfile>(`/api/agent-profiles/${editingAgentProfile.id}`, {
+        method: "PUT",
+        body: JSON.stringify(agentProfilePayloadFromDraft(agentProfileEditDraft)),
+      });
+      setAgentProfiles((current) =>
+        [...current.filter((item) => item.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)),
+      );
+      closeAgentProfileEditor();
+      setNotice(`Updated agent "${saved.name}".`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update agent profile");
+    } finally {
+      setSavingAgentProfileEdit(false);
+    }
+  }
+
   async function resetModelGenerationStats(modelId: number) {
     setError("");
     setResettingTimingModelId(modelId);
@@ -1514,15 +2396,87 @@ export default function App() {
   async function createConversation(event?: FormEvent) {
     event?.preventDefault();
     setError("");
+    const payload: { title?: string; participants?: ConversationParticipantPayload[] } = {
+      title: newTitle || undefined,
+    };
+    if (newConversationMode === "multi") {
+      if (newConversationParticipants.length < 1 || newConversationParticipants.length > 3) {
+        setError("Select 1 to 3 discussion participants");
+        return;
+      }
+      payload.participants = newConversationParticipants.map(participantPayloadFromDraft);
+    }
     const conversation = await request<Conversation>("/api/conversations", {
       method: "POST",
-      body: JSON.stringify({ title: newTitle || undefined }),
+      body: JSON.stringify(payload),
     });
     setNewTitle("");
+    setNewConversationMode("single");
+    setNewConversationParticipants([]);
     setIsNewConversationModalOpen(false);
     setConversations((current) => [conversation, ...current]);
     setActiveId(conversation.id);
     setPage("chat");
+  }
+
+  function openNewConversationModal() {
+    setError("");
+    setNewTitle("");
+    setNewConversationMode("single");
+    if (config?.models.length) {
+      setNewConversationParticipants([createParticipantDraft(config.models)]);
+    } else {
+      setNewConversationParticipants([]);
+    }
+    setParticipantEditorTarget("new");
+    setIsNewConversationModalOpen(true);
+  }
+
+  function openParticipantsModal() {
+    if (!detail?.participants.length) return;
+    setParticipantEditorTarget("edit");
+    setParticipantsDraft(
+      detail.participants.map((participant) => ({
+        llm_model_id: participant.llm_model_id,
+        personality: participant.personality,
+        name: participant.name,
+        tts_voice_uri: participant.tts_voice_uri ?? "",
+        tts_speech_rate: participant.tts_speech_rate ?? null,
+        agent_profile_id: participant.agent_profile_id ?? null,
+      })),
+    );
+    setIsParticipantsModalOpen(true);
+  }
+
+  async function saveParticipants(event?: FormEvent) {
+    event?.preventDefault();
+    if (!activeId || participantsDraft.length < 1 || participantsDraft.length > 3) {
+      setError("Select 1 to 3 discussion participants");
+      return;
+    }
+    setSavingParticipants(true);
+    setError("");
+    try {
+      const participants = await request<ConversationParticipant[]>(
+        `/api/conversations/${activeId}/participants`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ participants: participantsDraft.map(participantPayloadFromDraft) }),
+        },
+      );
+      setDetail((current) => (current ? { ...current, participants } : current));
+      setConversations((current) =>
+        current.map((item) =>
+          item.id === activeId ? { ...item, participant_count: participants.length } : item,
+        ),
+      );
+      setIsParticipantsModalOpen(false);
+      setNotice("Discussion participants updated.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update participants");
+    } finally {
+      setSavingParticipants(false);
+    }
   }
 
   async function changeConversationModel(modelId: number) {
@@ -1798,8 +2752,15 @@ export default function App() {
         setError("No speech detected.");
         return;
       }
+      const initialMessageCount = detail?.messages.length ?? 0;
+      appendOptimisticUserMessage(text);
       setInput("");
-      await submitMessage(text, { speakReply: true });
+      setIsTranscribing(false);
+      await submitMessage(text, {
+        speakReply: true,
+        userMessageAlreadyShown: true,
+        initialMessageCount,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not transcribe speech");
       if (activeId) {
@@ -1819,7 +2780,15 @@ export default function App() {
     await submitMessage();
   }
 
-  async function submitMessage(overrideContent?: string, options?: { speakReply?: boolean; image?: PendingImage | null }) {
+  async function submitMessage(
+    overrideContent?: string,
+    options?: {
+      speakReply?: boolean;
+      image?: PendingImage | null;
+      userMessageAlreadyShown?: boolean;
+      initialMessageCount?: number;
+    },
+  ) {
     const image = options?.image === undefined ? pendingImage : options.image;
     const content = (overrideContent ?? input).trim();
     const conversationId = activeId;
@@ -1829,7 +2798,13 @@ export default function App() {
       detail?.conversation.title ??
       conversations.find((conversation) => conversation.id === conversationId)?.title ??
       "Conversation";
-    const modelName = activeModelName;
+    const modelName = isMultiAgentConversation
+      ? `${activeParticipants.length} agents`
+      : activeModelName;
+    const totalSteps = isMultiAgentConversation
+      ? activeParticipants.length * Math.max(1, Math.min(10, discussionRounds))
+      : 1;
+    const initialMessageCount = options?.initialMessageCount ?? detail?.messages.length ?? 0;
     const abortController = new AbortController();
     generationAbortByConversationRef.current.set(conversationId, abortController);
 
@@ -1841,18 +2816,38 @@ export default function App() {
         modelName,
         contextPreview: null,
         startedAt: Date.now(),
+        isMultiAgent: isMultiAgentConversation,
+        totalSteps,
+        completedSteps: 0,
+        currentParticipantName: isMultiAgentConversation
+          ? participantDisplayName(activeParticipants[0], config?.models ?? [])
+          : undefined,
+        initialMessageCount,
+        speakReplies: options?.speakReply ?? false,
+        autoPlayReplies: isMultiAgentConversation,
       },
     }));
     setProgressModalConversationId(conversationId);
     setGenerationClock(Date.now());
 
     if (content || image) {
-      appendOptimisticExchange(content || "Image message");
+      if (options?.userMessageAlreadyShown) {
+        appendOptimisticAssistantPlaceholder();
+      } else {
+        appendOptimisticExchange(content || "Image message");
+      }
     }
     setInput("");
     clearPendingImage();
     setError("");
     setNotice("");
+
+    if (isMultiAgentConversation || options?.speakReply) {
+      beginAssistantReplyPlayback(conversationId, initialMessageCount);
+    }
+    if (options?.speakReply) {
+      speakRepliesByConversationRef.current[conversationId] = true;
+    }
 
     try {
       const payload: {
@@ -1862,6 +2857,8 @@ export default function App() {
         include_history: boolean | number;
         include_memories: boolean;
         include_all_memories: boolean;
+        discussion_rounds?: number;
+        answer_length: number;
       } = {
         content,
         include_history: historyLimitToIncludeHistory(
@@ -1871,7 +2868,11 @@ export default function App() {
         ),
         include_memories: includeMemories,
         include_all_memories: includeAllMemories,
+        answer_length: answerLength,
       };
+      if (isMultiAgentConversation) {
+        payload.discussion_rounds = Math.max(1, Math.min(10, discussionRounds));
+      }
       if (image) {
         payload.image_data = image.base64;
         payload.image_media_type = image.mediaType;
@@ -1894,6 +2895,7 @@ export default function App() {
       const response = await request<{
         user_message?: Message;
         assistant_message?: Message;
+        assistant_messages?: Message[];
         memory?: Memory;
       }>(`/api/conversations/${conversationId}/messages`, {
         method: "POST",
@@ -1901,17 +2903,15 @@ export default function App() {
         ...requestOptions,
       });
 
-      removeGenerationJob(conversationId);
       await loadConversation(conversationId);
+      removeGenerationJob(conversationId);
       await loadConversations();
+      speakRepliesByConversationRef.current[conversationId] = false;
 
       if (activeIdRef.current === conversationId) {
         if (response.memory) {
           applyRememberedMemory(response.memory);
           setNotice("Saved to this conversation's memory bank.");
-        }
-        if (options?.speakReply && response.assistant_message?.content) {
-          playAssistantMessage(response.assistant_message);
         }
       } else {
         setCompletedGenerationAlert({
@@ -1921,6 +2921,9 @@ export default function App() {
       }
     } catch (err) {
       removeGenerationJob(conversationId);
+      speakRepliesByConversationRef.current[conversationId] = false;
+      delete speakReplyStartIndexByConversationRef.current[conversationId];
+      delete spokenMessageIdsByConversationRef.current[conversationId];
       if (isAbortError(err)) {
         if (activeIdRef.current === conversationId) {
           setNotice("Generation cancelled.");
@@ -2446,10 +3449,7 @@ export default function App() {
             className="top-nav-new"
             aria-label="New conversation"
             title="New conversation"
-            onClick={() => {
-              setNewTitle("");
-              setIsNewConversationModalOpen(true);
-            }}
+            onClick={() => openNewConversationModal()}
           >
             <Plus size={18} strokeWidth={2.75} />
           </button>
@@ -2504,14 +3504,28 @@ export default function App() {
                     </>
                   )}
                   {activeConversation && editingConversationId !== activeConversation.id && (
-                    <button
-                      type="button"
-                      className="conversation-header-delete"
-                      title="Delete conversation"
-                      onClick={() => void openDeleteConversationModal(activeConversation)}
-                    >
-                      <Trash2 size={18} />
-                    </button>
+                    <>
+                      {isMultiAgentConversation && (
+                        <button
+                          type="button"
+                          className="conversation-header-participants"
+                          title="Edit discussion participants"
+                          onClick={openParticipantsModal}
+                          disabled={activeConversationGenerating}
+                        >
+                          <Sparkles size={16} />
+                          Participants
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="conversation-header-delete"
+                        title="Delete conversation"
+                        onClick={() => void openDeleteConversationModal(activeConversation)}
+                      >
+                        <Trash2 size={18} />
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
@@ -2530,10 +3544,19 @@ export default function App() {
                 const isThinkingPlaceholder =
                   message.role === "assistant" && message.id < 0 && !message.content && activeConversationGenerating;
                 const isSpeaking = speakingMessageId === message.id;
+                const speakerLabel = messageSpeakerLabel(
+                  message,
+                  activeParticipants,
+                  config?.models ?? [],
+                );
+                const participant =
+                  message.participant_id != null
+                    ? activeParticipants.find((item) => item.id === message.participant_id)
+                    : undefined;
                 return (
                   <article id={`message-${message.id}`} key={message.id} className={`message ${message.role}`}>
                     <div className="message-meta">
-                      <strong>{message.role === "user" ? "You" : "Assistant"}</strong>
+                      <strong title={participant?.personality?.trim() || undefined}>{speakerLabel}</strong>
                       <span>{formatDate(message.created_at)}</span>
                       {message.role === "assistant" &&
                         (message.llm_model ||
@@ -2744,20 +3767,52 @@ export default function App() {
                     </button>
                   </div>
                   <div className="composer-model-controls">
-                    <button
-                      type="button"
-                      className="model-pill composer-model-pill"
-                      title="Choose discussion model"
-                      onClick={() => setIsConversationModelModalOpen(true)}
-                      disabled={!detail || !config?.models.length}
-                    >
-                      <Bot size={16} />
-                      <span>{conversationModel?.model ?? "qwen3.5:9b"}</span>
-                    </button>
+                    {isMultiAgentConversation ? (
+                      <>
+                        <div className="participant-chips">
+                          {activeParticipants.map((participant) => (
+                            <span
+                              key={participant.id}
+                              className="participant-chip"
+                              title={participant.personality.trim() || participant.llm_model || "Agent"}
+                            >
+                              {participantDisplayName(participant, config?.models ?? [])}
+                            </span>
+                          ))}
+                        </div>
+                        <label className="discussion-rounds-input" title="Autonomous discussion rounds before you can reply again">
+                          <span>Rounds</span>
+                          <input
+                            type="number"
+                            min={1}
+                            max={10}
+                            value={discussionRounds}
+                            disabled={!activeId || activeConversationGenerating || isTranscribing}
+                            onChange={(event) => {
+                              const next = Math.max(1, Math.min(10, Number(event.target.value) || 1));
+                              setDiscussionRounds(next);
+                              localStorage.setItem(DISCUSSION_ROUNDS_STORAGE_KEY, String(next));
+                            }}
+                          />
+                        </label>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="model-pill composer-model-pill"
+                        title="Choose discussion model"
+                        onClick={() => setIsConversationModelModalOpen(true)}
+                        disabled={!detail || !config?.models.length}
+                      >
+                        <Bot size={16} />
+                        <span>{conversationModel?.model ?? "qwen3.5:9b"}</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
               <div className="composer-history">
+                <div className="composer-history-controls">
                 <label
                   className="composer-memory-toggle"
                   title={
@@ -2837,6 +3892,29 @@ export default function App() {
                     disabled={historyControlsDisabled}
                   />
                   Other conversations
+                </label>
+                </div>
+                <label
+                  className="composer-answer-length"
+                  title={
+                    answerLength >= ANSWER_LENGTH_MAX
+                      ? "Let the AI choose reply length"
+                      : "How long replies should be — highest priority (single and multi-agent chats)"
+                  }
+                >
+                  <span>Answer length</span>
+                  <input
+                    type="range"
+                    min={ANSWER_LENGTH_MIN}
+                    max={ANSWER_LENGTH_MAX}
+                    step={1}
+                    value={answerLength}
+                    disabled={historyControlsDisabled}
+                    onChange={(event) => updateAnswerLength(Number(event.currentTarget.value))}
+                    aria-label="Answer length"
+                    aria-valuetext={answerLengthLabel(answerLength)}
+                  />
+                  <span className="composer-answer-length-value">{answerLengthLabel(answerLength)}</span>
                 </label>
               </div>
             </form>
@@ -3088,13 +4166,70 @@ export default function App() {
         )}
         {page === "settings" && (
           <section className="settings-page">
-            <header className="page-header">
+            <header className="page-header settings-page-header">
               <div>
-                <p className="eyebrow">LLM config</p>
-                <h1>Model settings</h1>
+                <p className="eyebrow">Configuration</p>
+                <h1>Settings</h1>
+                <nav className="settings-tabs" role="tablist" aria-label="Settings sections">
+                  <button
+                    type="button"
+                    role="tab"
+                    id="settings-tab-models"
+                    aria-selected={settingsTab === "models"}
+                    aria-controls="settings-panel-models"
+                    className={`settings-tab ${settingsTab === "models" ? "settings-tab-active" : ""}`}
+                    onClick={() => setSettingsTab("models")}
+                  >
+                    <Bot size={16} />
+                    Models
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="settings-tab-agents"
+                    aria-selected={settingsTab === "agents"}
+                    aria-controls="settings-panel-agents"
+                    className={`settings-tab ${settingsTab === "agents" ? "settings-tab-active" : ""}`}
+                    onClick={() => setSettingsTab("agents")}
+                  >
+                    <Sparkles size={16} />
+                    Agents
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="settings-tab-prompt"
+                    aria-selected={settingsTab === "prompt"}
+                    aria-controls="settings-panel-prompt"
+                    className={`settings-tab ${settingsTab === "prompt" ? "settings-tab-active" : ""}`}
+                    onClick={() => setSettingsTab("prompt")}
+                  >
+                    <Brain size={16} />
+                    Default prompt
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="settings-tab-speech"
+                    aria-selected={settingsTab === "speech"}
+                    aria-controls="settings-panel-speech"
+                    className={`settings-tab ${settingsTab === "speech" ? "settings-tab-active" : ""}`}
+                    onClick={() => setSettingsTab("speech")}
+                  >
+                    <Mic size={16} />
+                    Speech
+                  </button>
+                </nav>
               </div>
             </header>
-            <form className="settings-card model-settings-card" onSubmit={saveConfig}>
+            {settingsTab === "models" && (
+            <form
+              className="settings-card model-settings-card"
+              id="settings-panel-models"
+              role="tabpanel"
+              aria-labelledby="settings-tab-models"
+              onSubmit={saveConfig}
+            >
               <div className="model-settings-header">
                 <p>Save local Ollama models or external OpenAI-compatible APIs here, then tick the one to use for new chat replies. Assign each model a playback voice to tell them apart when listening.</p>
                 <button type="button" onClick={openAddModelModal}>
@@ -3242,8 +4377,83 @@ export default function App() {
                 Save settings
               </button>
             </form>
+            )}
 
-            <form className="settings-card prompt-settings-card" onSubmit={savePromptConfig}>
+            {settingsTab === "agents" && (
+            <section
+              className="settings-card agent-library-card"
+              id="settings-panel-agents"
+              role="tabpanel"
+              aria-labelledby="settings-tab-agents"
+            >
+              <div className="model-settings-header">
+                <div>
+                  <h2>Agent library</h2>
+                  <p>Saved agents keep their name, personality, model, voice, and speech speed. Click an agent to edit it.</p>
+                </div>
+              </div>
+              {!agentProfiles.length && <p className="hint">No saved agents yet. Create one in a multi-agent conversation and use Save to library.</p>}
+              <div className="agent-library-list">
+                {agentProfiles.map((profile) => (
+                  <article className="agent-library-item" key={profile.id}>
+                    <button
+                      type="button"
+                      className="agent-library-item-main"
+                      title={`Edit ${profile.name}`}
+                      onClick={() => openAgentProfileEditor(profile)}
+                    >
+                      <strong className="agent-library-item-name">{profile.name}</strong>
+                      <p className="agent-library-item-model">
+                        {profile.llm_model} ({profile.llm_provider})
+                      </p>
+                      <p
+                        className={`agent-library-item-personality${
+                          profile.personality.trim() ? "" : " is-empty"
+                        }`}
+                      >
+                        {profile.personality.trim() || "No personality set"}
+                      </p>
+                      <div className="agent-library-item-meta">
+                        <p className="agent-library-item-voice">
+                          Voice:{" "}
+                          {profile.tts_voice_uri
+                            ? ttsVoiceOptions.find((voice) => voice.uri === profile.tts_voice_uri)?.label ??
+                              profile.tts_voice_uri
+                            : "Default"}
+                        </p>
+                        <p className="agent-library-item-speed">
+                          Speech speed:{" "}
+                          {profile.tts_speech_rate != null
+                            ? `${profile.tts_speech_rate.toFixed(1)}×`
+                            : "Global default"}
+                        </p>
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      className="delete-model-button agent-library-item-delete"
+                      title={`Delete ${profile.name}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void deleteAgentProfile(profile.id);
+                      }}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </article>
+                ))}
+              </div>
+            </section>
+            )}
+
+            {settingsTab === "prompt" && (
+            <form
+              className="settings-card prompt-settings-card"
+              id="settings-panel-prompt"
+              role="tabpanel"
+              aria-labelledby="settings-tab-prompt"
+              onSubmit={savePromptConfig}
+            >
               <div>
                 <h2>Default prompt</h2>
                 <p>
@@ -3278,8 +4488,16 @@ export default function App() {
                 </button>
               </div>
             </form>
+            )}
 
-            <form className="settings-card speech-settings-card" onSubmit={saveSpeechConfig}>
+            {settingsTab === "speech" && (
+            <form
+              className="settings-card speech-settings-card"
+              id="settings-panel-speech"
+              role="tabpanel"
+              aria-labelledby="settings-tab-speech"
+              onSubmit={saveSpeechConfig}
+            >
               <div>
                 <h2>Speech settings</h2>
                 <p>Choose the Whisper model for microphone input. Assign a playback voice per model above, or set a default fallback here.</p>
@@ -3331,6 +4549,7 @@ export default function App() {
                 Save speech settings
               </button>
             </form>
+            )}
           </section>
         )}
       </main>
@@ -3450,6 +4669,11 @@ export default function App() {
                     {conversation.title}
                   </strong>
                   <span className="conversation-select-meta">
+                    {(conversation.participant_count ?? 0) > 0 && (
+                      <span className="conversation-multi-badge" title="Multi-agent discussion">
+                        Multi
+                      </span>
+                    )}
                     {generationJobs[conversation.id] ? (
                       <span
                         className="conversation-generating-pill"
@@ -3495,7 +4719,7 @@ export default function App() {
 
       {isNewConversationModalOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setIsNewConversationModalOpen(false)}>
-          <form className="modal-card" onSubmit={createConversation} onMouseDown={(event) => event.stopPropagation()}>
+          <form className="modal-card new-conversation-modal participants-modal" onSubmit={createConversation} onMouseDown={(event) => event.stopPropagation()}>
             <div>
               <p className="eyebrow">New conversation</p>
               <h2>Name this conversation</h2>
@@ -3506,6 +4730,44 @@ export default function App() {
               onChange={(event) => setNewTitle(event.target.value)}
               placeholder="Conversation name"
             />
+            <div className="conversation-mode-toggle">
+              <label>
+                <input
+                  type="radio"
+                  name="conversation-mode"
+                  checked={newConversationMode === "single"}
+                  onChange={() => setNewConversationMode("single")}
+                />
+                Single model
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="conversation-mode"
+                  checked={newConversationMode === "multi"}
+                  onChange={() => {
+                    setNewConversationMode("multi");
+                    if (!newConversationParticipants.length && config?.models.length) {
+                      setNewConversationParticipants([createParticipantDraft(config.models)]);
+                    }
+                  }}
+                />
+                Multi-agent discussion
+              </label>
+            </div>
+            {newConversationMode === "multi" && config?.models.length ? (
+              <ParticipantEditor
+                participants={newConversationParticipants}
+                onChange={setNewConversationParticipants}
+                models={config.models}
+                agentProfiles={agentProfiles}
+                ttsVoiceOptions={ttsVoiceOptions}
+                onSaveProfile={saveAgentProfileFromDraft}
+                onUpdateProfile={updateAgentProfileFromDraft}
+                onPlayVoiceSample={playModelVoiceSample}
+                savingProfileIndex={participantEditorTarget === "new" ? savingAgentProfileIndex : null}
+              />
+            ) : null}
             <div className="modal-actions">
               <button type="button" className="secondary-button" onClick={() => setIsNewConversationModalOpen(false)}>
                 Cancel
@@ -3513,6 +4775,88 @@ export default function App() {
               <button type="submit">
                 <Plus size={16} />
                 Create
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {editingAgentProfile && agentProfileEditDraft && config?.models.length && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={closeAgentProfileEditor}>
+          <form
+            className="modal-card agent-profile-modal"
+            onSubmit={saveAgentProfileEdit}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="agent-profile-modal-header">
+              <p className="eyebrow">Agent library</p>
+              <h2>{editingAgentProfile.name}</h2>
+              <p className="modal-copy">Changes apply when this agent is used in new or updated discussions.</p>
+            </div>
+            <AgentProfileFields
+              draft={agentProfileEditDraft}
+              onChange={(patch) => setAgentProfileEditDraft((current) => (current ? { ...current, ...patch } : current))}
+              models={config.models}
+              ttsVoiceOptions={ttsVoiceOptions}
+              onPlayVoiceSample={playModelVoiceSample}
+            />
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={closeAgentProfileEditor}>
+                Cancel
+              </button>
+              <button type="submit" disabled={savingAgentProfileEdit || !agentProfileEditDraft.name.trim()}>
+                {savingAgentProfileEdit ? (
+                  <>
+                    <Loader2 size={16} className="spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save size={16} />
+                    Save
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {isParticipantsModalOpen && config?.models.length && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setIsParticipantsModalOpen(false)}>
+          <form className="modal-card new-conversation-modal participants-modal" onSubmit={saveParticipants} onMouseDown={(event) => event.stopPropagation()}>
+            <div>
+              <p className="eyebrow">Discussion participants</p>
+              <h2>Edit agents</h2>
+              <p className="modal-copy">Changes apply to the next messages. Existing replies keep their original agent metadata.</p>
+            </div>
+            <ParticipantEditor
+              participants={participantsDraft}
+              onChange={setParticipantsDraft}
+              models={config.models}
+              agentProfiles={agentProfiles}
+              ttsVoiceOptions={ttsVoiceOptions}
+              onSaveProfile={saveAgentProfileFromDraft}
+              onUpdateProfile={updateAgentProfileFromDraft}
+              onPlayVoiceSample={playModelVoiceSample}
+              savingProfileIndex={participantEditorTarget === "edit" ? savingAgentProfileIndex : null}
+            />
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={() => setIsParticipantsModalOpen(false)}>
+                Cancel
+              </button>
+              <button type="submit" disabled={savingParticipants}>
+                {savingParticipants ? (
+                  <>
+                    <Loader2 size={16} className="spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save size={16} />
+                    Save
+                  </>
+                )}
               </button>
             </div>
           </form>
@@ -3812,8 +5156,17 @@ export default function App() {
                 <Brain size={36} />
               </div>
               <div>
-                <p>Generating with</p>
-                <strong>{progressModalJob.modelName}</strong>
+                <p>{progressModalJob.isMultiAgent ? "Multi-agent discussion" : "Generating with"}</p>
+                <strong>
+                  {progressModalJob.isMultiAgent && progressModalJob.totalSteps
+                    ? progressModalJob.currentParticipantName
+                      ? `${progressModalJob.currentParticipantName} · ${Math.min(
+                          progressModalJob.completedSteps ?? 0,
+                          progressModalJob.totalSteps,
+                        )}/${progressModalJob.totalSteps}`
+                      : `Step ${Math.min(progressModalJob.completedSteps ?? 0, progressModalJob.totalSteps)}/${progressModalJob.totalSteps}`
+                    : progressModalJob.modelName}
+                </strong>
                 <span className="llm-progress-provider">{progressModalJob.conversationTitle}</span>
               </div>
             </div>
@@ -3865,6 +5218,9 @@ export default function App() {
                     <dd>{progressModalJob.contextPreview.total_chars.toLocaleString()}</dd>
                   </div>
                 </dl>
+                {progressModalJob.contextPreview.multi_agent_note && (
+                  <p className="llm-context-memories">{progressModalJob.contextPreview.multi_agent_note}</p>
+                )}
                 {progressModalJob.contextPreview.generation_estimate_sec != null && (
                   <div className="llm-progress-estimate">
                     <div

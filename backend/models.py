@@ -1,10 +1,92 @@
 from typing import List, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+TTS_SPEECH_RATE_MIN = 0.5
+TTS_SPEECH_RATE_MAX = 2.5
+
+
+def _clamp_tts_speech_rate(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return max(TTS_SPEECH_RATE_MIN, min(TTS_SPEECH_RATE_MAX, value))
+
+
+class ConversationParticipantUpdate(BaseModel):
+    llm_model_id: int
+    personality: str = ""
+    name: str = ""
+    tts_voice_uri: Optional[str] = None
+    tts_speech_rate: Optional[float] = None
+    agent_profile_id: Optional[int] = None
+
+    @field_validator("tts_speech_rate")
+    @classmethod
+    def validate_tts_speech_rate(cls, value: Optional[float]) -> Optional[float]:
+        return _clamp_tts_speech_rate(value)
+
+
+class ConversationParticipantRead(BaseModel):
+    id: int
+    conversation_id: int
+    llm_model_id: int
+    personality: str
+    name: str
+    sort_order: int
+    tts_voice_uri: Optional[str] = None
+    tts_speech_rate: Optional[float] = None
+    agent_profile_id: Optional[int] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    llm_comments: Optional[str] = None
+
+
+class AgentProfileCreate(BaseModel):
+    name: str = Field(min_length=1)
+    personality: str = ""
+    llm_model_id: int
+    tts_voice_uri: Optional[str] = None
+    tts_speech_rate: Optional[float] = None
+
+    @field_validator("tts_speech_rate")
+    @classmethod
+    def validate_tts_speech_rate(cls, value: Optional[float]) -> Optional[float]:
+        return _clamp_tts_speech_rate(value)
+
+
+class AgentProfileUpdate(BaseModel):
+    name: str = Field(min_length=1)
+    personality: str = ""
+    llm_model_id: int
+    tts_voice_uri: Optional[str] = None
+    tts_speech_rate: Optional[float] = None
+
+    @field_validator("tts_speech_rate")
+    @classmethod
+    def validate_tts_speech_rate(cls, value: Optional[float]) -> Optional[float]:
+        return _clamp_tts_speech_rate(value)
+
+
+class AgentProfileRead(BaseModel):
+    id: int
+    name: str
+    personality: str
+    llm_model_id: int
+    tts_voice_uri: Optional[str] = None
+    tts_speech_rate: Optional[float] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class ConversationParticipantsUpdate(BaseModel):
+    participants: List[ConversationParticipantUpdate] = Field(min_length=1, max_length=3)
 
 
 class ConversationCreate(BaseModel):
     title: Optional[str] = None
+    participants: Optional[List[ConversationParticipantUpdate]] = None
 
 
 class ConversationTitleUpdate(BaseModel):
@@ -29,6 +111,7 @@ class Conversation(BaseModel):
     title: str
     sort_order: int
     llm_model_id: Optional[int] = None
+    participant_count: int = 0
     created_at: str
     updated_at: str
 
@@ -44,6 +127,7 @@ class Message(BaseModel):
     llm_model: Optional[str] = None
     generation_ms: Optional[int] = None
     include_history: Optional[Union[bool, int]] = None
+    participant_id: Optional[int] = None
     created_at: str
 
 
@@ -73,6 +157,7 @@ class ConversationDetail(BaseModel):
     conversation: Conversation
     messages: List[Message]
     memories: List[Memory]
+    participants: List[ConversationParticipantRead] = []
 
 
 class MessageCreate(BaseModel):
@@ -82,6 +167,13 @@ class MessageCreate(BaseModel):
     include_history: Union[bool, int] = True
     include_memories: bool = True
     include_all_memories: bool = False
+    discussion_rounds: int = 1
+    answer_length: int = 3
+
+    @field_validator("answer_length")
+    @classmethod
+    def validate_answer_length(cls, value: int) -> int:
+        return max(1, min(5, int(value)))
 
     @model_validator(mode="after")
     def validate_content_or_image(self):
@@ -97,6 +189,7 @@ class MessageCreate(BaseModel):
 class MessageResponse(BaseModel):
     user_message: Optional[Message] = None
     assistant_message: Optional[Message] = None
+    assistant_messages: Optional[List[Message]] = None
     memory: Optional[Memory] = None
 
 
@@ -126,6 +219,7 @@ class LlmContextPreview(BaseModel):
     generation_estimate_sec: Optional[float] = None
     seconds_per_char: Optional[float] = None
     generation_sample_count: int = 0
+    multi_agent_note: Optional[str] = None
 
 
 class RememberCreate(BaseModel):

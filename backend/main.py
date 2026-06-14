@@ -16,14 +16,36 @@ from .database import (
     init_db,
     row_to_dict,
 )
+from .agent_profiles import (
+    agent_profile_or_404,
+    create_agent_profile,
+    delete_agent_profile,
+    load_agent_profiles,
+    update_agent_profile,
+)
 from .llm import chat as llm_chat
+from .multi_agent import (
+    load_participants,
+    public_participant,
+    replace_participants,
+    run_multi_agent_turns,
+    clamp_discussion_rounds,
+    participant_display_name,
+    previous_discussion_speaker,
+    build_discussion_response_instruction,
+)
 from .stt import WHISPER_MODEL_OPTIONS, set_whisper_model, transcribe_audio_bytes
 from .models import (
+    AgentProfileCreate,
+    AgentProfileRead,
+    AgentProfileUpdate,
     Conversation,
     ConversationCreate,
     ConversationDelete,
     ConversationDetail,
     ConversationModelUpdate,
+    ConversationParticipantRead,
+    ConversationParticipantsUpdate,
     ConversationReorder,
     ConversationTitleUpdate,
     CrossConversationMemoryMerge,
@@ -75,6 +97,20 @@ def _conversation_or_404(connection, conversation_id: int) -> dict:
     )
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversation
+
+
+def _conversation_participant_count(connection, conversation_id: int) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) AS count FROM conversation_participants WHERE conversation_id = ?",
+        (conversation_id,),
+    ).fetchone()
+    return int(row["count"])
+
+
+def _public_conversation(connection, conversation_id: int) -> dict:
+    conversation = _conversation_or_404(connection, conversation_id)
+    conversation["participant_count"] = _conversation_participant_count(connection, conversation_id)
     return conversation
 
 
@@ -145,13 +181,15 @@ def _insert_message(
     image_media_type: str = None,
     generation_ms: int = None,
     include_history: int = None,
+    participant_id: int = None,
 ) -> dict:
     cursor = connection.execute(
         """
         INSERT INTO messages (
-            conversation_id, role, content, llm_provider, llm_model, image_data, image_media_type, generation_ms, include_history
+            conversation_id, role, content, llm_provider, llm_model, image_data, image_media_type,
+            generation_ms, include_history, participant_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             conversation_id,
@@ -163,6 +201,7 @@ def _insert_message(
             image_media_type,
             generation_ms,
             include_history,
+            participant_id,
         ),
     )
     connection.execute(
@@ -484,9 +523,11 @@ def _normalize_image_payload(image_data: str, image_media_type: str) -> tuple[st
     return base64.b64encode(raw).decode("ascii"), media_type
 
 
-def _format_message_for_llm(row: dict, provider: str) -> dict:
+def _format_message_for_llm(row: dict, provider: str, *, speaker_label: str = None) -> dict:
     role = row["role"]
     content = row["content"]
+    if speaker_label and role == "assistant":
+        content = f"[{speaker_label}]: {content}"
     image_data = row.get("image_data")
     image_media_type = row.get("image_media_type")
 
@@ -534,6 +575,31 @@ def _stored_include_history(include_history: Union[bool, int]) -> int:
     return -1
 
 
+def _answer_length_constraint(answer_length: int) -> str | None:
+    level = max(1, min(5, int(answer_length)))
+    if level >= 5:
+        return None
+    instructions = {
+        1: "Reply in exactly 1 sentence. Do not use more than one sentence.",
+        2: "Reply in about 2–3 sentences.",
+        3: "Reply in about 3–4 sentences.",
+        4: "Reply in about 4–5 sentences.",
+    }
+    return instructions[level]
+
+
+def _answer_length_priority_message(answer_length: int) -> str | None:
+    constraint = _answer_length_constraint(answer_length)
+    if not constraint:
+        return None
+    return (
+        "HIGHEST PRIORITY — response length:\n"
+        f"{constraint}\n"
+        "This length requirement overrides your usual verbosity, personality, and other instructions. "
+        "Stay within this limit even when the topic feels like it deserves more detail."
+    )
+
+
 def _memories_excluding_history_duplicates(memories: List[dict], history_rows: List[dict]) -> List[dict]:
     history_ids = {row["id"] for row in history_rows if row.get("id") is not None}
     history_contents = {
@@ -553,6 +619,26 @@ def _memories_excluding_history_duplicates(memories: List[dict], history_rows: L
     return included
 
 
+def _participant_speaker_label(connection, participant_id: int, participants_by_id: dict) -> str:
+    if participant_id in participants_by_id:
+        return participant_display_name(participants_by_id[participant_id])
+    participant = row_to_dict(
+        connection.execute(
+            """
+            SELECT cp.id, cp.personality, cp.name, cp.tts_voice_uri, lm.model AS llm_model, lm.comments AS llm_comments
+            FROM conversation_participants cp
+            JOIN llm_models lm ON lm.id = cp.llm_model_id
+            WHERE cp.id = ?
+            """,
+            (participant_id,),
+        ).fetchone()
+    )
+    if participant:
+        participants_by_id[participant_id] = participant
+        return participant_display_name(participant)
+    return "Assistant"
+
+
 def _build_llm_messages(
     connection,
     conversation_id: int,
@@ -562,6 +648,8 @@ def _build_llm_messages(
     include_memories: bool = True,
     include_all_memories: bool = False,
     pending_user: dict = None,
+    participant: dict = None,
+    answer_length: int = 3,
 ) -> tuple[List[dict], int, int]:
     memories = (
         _active_memories(connection, conversation_id, sort="created_at", order="asc")
@@ -582,7 +670,7 @@ def _build_llm_messages(
     if history_limit > 0:
         history = connection.execute(
             """
-            SELECT id, role, content, image_data, image_media_type FROM messages
+            SELECT id, role, content, image_data, image_media_type, participant_id FROM messages
             WHERE conversation_id = ?
             ORDER BY id DESC
             LIMIT ?
@@ -595,7 +683,7 @@ def _build_llm_messages(
         if not pending_user:
             history = connection.execute(
                 """
-                SELECT id, role, content, image_data, image_media_type FROM messages
+                SELECT id, role, content, image_data, image_media_type, participant_id FROM messages
                 WHERE conversation_id = ? AND role = 'user'
                 ORDER BY id DESC
                 LIMIT 1
@@ -617,6 +705,17 @@ def _build_llm_messages(
             "content": prompt_config["default_prompt"],
         }
     ]
+    length_priority = _answer_length_priority_message(answer_length)
+    if length_priority:
+        messages.append({"role": "system", "content": length_priority})
+    personality = (participant.get("personality") or "").strip() if participant else ""
+    if personality:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Your perspective and role:\n{personality}",
+            }
+        )
     if included_memories:
         memory_text = "\n".join(f"- {memory['content']}" for memory in included_memories)
         messages.append({"role": "system", "content": f"Conversation memory bank:\n{memory_text}"})
@@ -624,8 +723,50 @@ def _build_llm_messages(
         all_memory_text = "\n".join(f"- {memory['content']}" for memory in included_all_memories)
         messages.append({"role": "user", "content": f"User memories:\n{all_memory_text}"})
 
+    participants_by_id = {}
+    all_participants = []
+    if participant:
+        all_participants = load_participants(connection, conversation_id)
+        for item in all_participants:
+            participants_by_id[item["id"]] = item
+
     for row in history_rows:
-        messages.append(_format_message_for_llm(row, provider))
+        speaker_label = None
+        if row.get("role") == "assistant" and row.get("participant_id"):
+            speaker_label = _participant_speaker_label(connection, row["participant_id"], participants_by_id)
+        messages.append(_format_message_for_llm(row, provider, speaker_label=speaker_label))
+
+    if participant and len(all_participants) > 1:
+        def resolve_participant_name(participant_id: int) -> str:
+            return _participant_speaker_label(connection, participant_id, participants_by_id)
+
+        previous_speaker_label, _previous_row = previous_discussion_speaker(
+            history_rows,
+            resolve_participant_name=resolve_participant_name,
+        )
+        messages.append(
+            {
+                "role": "system",
+                "content": build_discussion_response_instruction(
+                    participant,
+                    all_participants,
+                    previous_speaker_label,
+                ),
+            }
+        )
+
+    length_constraint = _answer_length_constraint(answer_length)
+    if length_constraint:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Final reminder — highest priority before you reply:\n"
+                    f"{length_constraint}"
+                ),
+            }
+        )
+
     return messages, len(included_memories), len(included_all_memories)
 
 
@@ -860,6 +1001,31 @@ def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/api/agent-profiles", response_model=List[AgentProfileRead])
+def list_agent_profiles() -> List[dict]:
+    with get_connection() as connection:
+        return load_agent_profiles(connection)
+
+
+@app.post("/api/agent-profiles", response_model=AgentProfileRead)
+def create_agent_profile_route(payload: AgentProfileCreate) -> dict:
+    with get_connection() as connection:
+        return create_agent_profile(connection, payload, _llm_model_or_404)
+
+
+@app.put("/api/agent-profiles/{profile_id}", response_model=AgentProfileRead)
+def update_agent_profile_route(profile_id: int, payload: AgentProfileUpdate) -> dict:
+    with get_connection() as connection:
+        return update_agent_profile(connection, profile_id, payload, _llm_model_or_404)
+
+
+@app.delete("/api/agent-profiles/{profile_id}")
+def delete_agent_profile_route(profile_id: int) -> dict:
+    with get_connection() as connection:
+        delete_agent_profile(connection, profile_id)
+        return {"ok": True}
+
+
 @app.post("/api/stt/transcribe")
 async def transcribe_speech(file: UploadFile = File(...)) -> dict:
     data = await file.read()
@@ -974,7 +1140,16 @@ def update_speech_config(payload: SpeechConfigUpdate) -> dict:
 def list_conversations() -> List[dict]:
     with get_connection() as connection:
         rows = connection.execute("SELECT * FROM conversations ORDER BY sort_order ASC, updated_at DESC, id DESC").fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            conversation = dict(row)
+            count = connection.execute(
+                "SELECT COUNT(*) AS count FROM conversation_participants WHERE conversation_id = ?",
+                (conversation["id"],),
+            ).fetchone()["count"]
+            conversation["participant_count"] = int(count)
+            result.append(conversation)
+        return result
 
 
 @app.post("/api/conversations", response_model=Conversation)
@@ -989,7 +1164,10 @@ def create_conversation(payload: ConversationCreate) -> dict:
             "INSERT INTO conversations (title, sort_order, llm_model_id) VALUES (?, ?, ?)",
             (title, next_sort_order, active_model["id"]),
         )
-        return row_to_dict(connection.execute("SELECT * FROM conversations WHERE id = ?", (cursor.lastrowid,)).fetchone())
+        conversation_id = cursor.lastrowid
+        if payload.participants:
+            replace_participants(connection, conversation_id, payload.participants, _llm_model_or_404)
+        return _public_conversation(connection, conversation_id)
 
 
 @app.put("/api/conversations/{conversation_id}/title", response_model=Conversation)
@@ -1008,7 +1186,7 @@ def update_conversation_title(conversation_id: int, payload: ConversationTitleUp
             """,
             (title, conversation_id),
         )
-        return row_to_dict(connection.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone())
+        return _public_conversation(connection, conversation_id)
 
 
 @app.put("/api/conversations/{conversation_id}/model", response_model=Conversation)
@@ -1024,7 +1202,7 @@ def update_conversation_model(conversation_id: int, payload: ConversationModelUp
             """,
             (payload.llm_model_id, conversation_id),
         )
-        return row_to_dict(connection.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone())
+        return _public_conversation(connection, conversation_id)
 
 
 @app.put("/api/conversations/reorder", response_model=List[Conversation])
@@ -1088,7 +1266,16 @@ def get_conversation(conversation_id: int) -> dict:
             (conversation_id,),
         ).fetchall()]
         memories = _active_memories(connection, conversation_id)
-        return {"conversation": conversation, "messages": messages, "memories": memories}
+        participants = [public_participant(row) for row in load_participants(connection, conversation_id)]
+        return {"conversation": conversation, "messages": messages, "memories": memories, "participants": participants}
+
+
+@app.put("/api/conversations/{conversation_id}/participants", response_model=List[ConversationParticipantRead])
+def update_conversation_participants(conversation_id: int, payload: ConversationParticipantsUpdate) -> List[dict]:
+    with get_connection() as connection:
+        _conversation_or_404(connection, conversation_id)
+        rows = replace_participants(connection, conversation_id, payload.participants, _llm_model_or_404)
+        return [public_participant(row) for row in rows]
 
 
 @app.post("/api/conversations/{conversation_id}/llm-context-preview", response_model=LlmContextPreview)
@@ -1108,7 +1295,16 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
 
     with get_connection() as connection:
         conversation = _conversation_or_404(connection, conversation_id)
-        config = _conversation_llm_model(connection, conversation)
+        participants = load_participants(connection, conversation_id)
+        multi_agent_note = None
+        if participants:
+            config = _llm_model_or_404(connection, participants[0]["llm_model_id"])
+            multi_agent_note = (
+                f"Multi-agent preview for first participant ({config['model']}). "
+                "Other participants use the same shared context with different models and personalities."
+            )
+        else:
+            config = _conversation_llm_model(connection, conversation)
         llm_messages, included_memory_count, included_all_memory_count = _build_llm_messages(
             connection,
             conversation_id,
@@ -1117,8 +1313,10 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
             include_memories=payload.include_memories,
             include_all_memories=payload.include_all_memories,
             pending_user=pending_user,
+            participant=participants[0] if participants else None,
+            answer_length=payload.answer_length,
         )
-        return _attach_generation_estimate(
+        summary = _attach_generation_estimate(
             connection,
             _summarize_llm_context(
                 llm_messages,
@@ -1131,6 +1329,9 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
                 all_memory_count=included_all_memory_count,
             ),
         )
+        if multi_agent_note:
+            summary["multi_agent_note"] = multi_agent_note
+        return summary
 
 
 @app.post("/api/conversations/{conversation_id}/messages", response_model=MessageResponse)
@@ -1173,6 +1374,33 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
             title = title_source[:60] + ("..." if len(title_source) > 60 else "")
             connection.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
 
+        participants = load_participants(connection, conversation_id)
+        if participants:
+            discussion_rounds = clamp_discussion_rounds(payload.discussion_rounds)
+            assistant_messages = run_multi_agent_turns(
+                connection,
+                conversation_id,
+                participants,
+                discussion_rounds=discussion_rounds,
+                include_history=payload.include_history,
+                include_memories=payload.include_memories,
+                include_all_memories=payload.include_all_memories,
+                answer_length=payload.answer_length,
+                build_llm_messages=_build_llm_messages,
+                insert_message=_insert_message,
+                update_generation_stats=_update_generation_stats,
+                summarize_llm_context=_summarize_llm_context,
+                llm_model_or_404=_llm_model_or_404,
+                stored_include_history=_stored_include_history,
+                commit_connection=lambda conn: conn.commit(),
+            )
+            last_message = assistant_messages[-1] if assistant_messages else None
+            return {
+                "user_message": user_message,
+                "assistant_message": last_message,
+                "assistant_messages": assistant_messages,
+            }
+
         config = _conversation_llm_model(connection, conversation)
         llm_messages, included_memory_count, included_all_memory_count = _build_llm_messages(
             connection,
@@ -1181,6 +1409,7 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
             include_history=payload.include_history,
             include_memories=payload.include_memories,
             include_all_memories=payload.include_all_memories,
+            answer_length=payload.answer_length,
         )
         context_summary = _summarize_llm_context(
             llm_messages,
