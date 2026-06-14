@@ -12,12 +12,24 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .database import (
+    DEFAULT_AGENTIC_MAX_ITERATIONS,
+    DEFAULT_DIRECTOR_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_MULTI_AGENT_PROMPT,
     generate_memory_title as fallback_memory_title,
     get_connection,
     init_db,
     row_to_dict,
+)
+from .agentic import run_agentic_turn
+from .documents import (
+    archive_document,
+    create_document,
+    document_or_404,
+    load_documents,
+    normalize_upload_to_markdown,
+    sanitize_filename,
+    update_document,
 )
 from .agent_profiles import (
     agent_profile_or_404,
@@ -42,14 +54,19 @@ from .multi_agent import (
     build_participant_character_instruction,
     build_single_character_instruction,
 )
+from .scrape import scrape_website_content
 from .stt import WHISPER_MODEL_OPTIONS, get_whisper_model, set_whisper_model, transcribe_audio_bytes
 from .tts import list_elevenlabs_voices, synthesize_elevenlabs_speech
 from .memory_map import create_memory_map, get_viz_spec_detail, list_conversation_viz_specs, update_viz_client_state
 from .models import (
     AgentProfileCreate,
+    AgentPersonalityDraftCreate,
+    AgentPersonalityDraftRead,
     AgentProfileRead,
     AgentProfileUpdate,
+    AgenticControlRequest,
     Conversation,
+    ConversationAgenticSetupUpdate,
     ConversationCreate,
     ConversationDelete,
     ConversationDetail,
@@ -59,6 +76,11 @@ from .models import (
     ConversationReorder,
     ConversationTitleUpdate,
     CrossConversationMemoryMerge,
+    Document,
+    DocumentCreate,
+    DocumentUpdate,
+    DocumentUploadResponse,
+    DocumentWebsiteUploadRequest,
     ElevenLabsSynthesizeRequest,
     ElevenLabsVoiceRead,
     LlmContextPreview,
@@ -130,7 +152,17 @@ def _conversation_participant_count(connection, conversation_id: int) -> int:
 def _public_conversation(connection, conversation_id: int) -> dict:
     conversation = _conversation_or_404(connection, conversation_id)
     conversation["participant_count"] = _conversation_participant_count(connection, conversation_id)
+    conversation["mode"] = (conversation.get("mode") or "single").strip() or "single"
+    if conversation["mode"] == "agentic" and not conversation.get("agentic_status"):
+        conversation["agentic_status"] = "idle"
     return conversation
+
+
+def _public_message(message: dict) -> dict:
+    public = dict(message)
+    metadata = public.pop("metadata_json", None)
+    public["metadata"] = json.loads(metadata) if metadata else None
+    return public
 
 
 def _all_active_memories(
@@ -201,14 +233,17 @@ def _insert_message(
     generation_ms: int = None,
     include_history: int = None,
     participant_id: int = None,
+    message_kind: str = None,
+    metadata_json: str = None,
+    parent_message_id: int = None,
 ) -> dict:
     cursor = connection.execute(
         """
         INSERT INTO messages (
             conversation_id, role, content, llm_provider, llm_model, image_data, image_media_type,
-            generation_ms, include_history, participant_id
+            generation_ms, include_history, participant_id, message_kind, metadata_json, parent_message_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             conversation_id,
@@ -221,13 +256,18 @@ def _insert_message(
             generation_ms,
             include_history,
             participant_id,
+            message_kind,
+            metadata_json,
+            parent_message_id,
         ),
     )
     connection.execute(
         "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         (conversation_id,),
     )
-    return row_to_dict(connection.execute("SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)).fetchone())
+    return _public_message(
+        dict(connection.execute("SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)).fetchone())
+    )
 
 
 def _clean_generated_memory_title(title: str, content: str) -> str:
@@ -1053,6 +1093,65 @@ def create_agent_profile_route(payload: AgentProfileCreate) -> dict:
         return create_agent_profile(connection, payload, _llm_model_or_404)
 
 
+@app.post("/api/agent-profiles/draft-personality", response_model=AgentPersonalityDraftRead)
+def draft_agent_personality(payload: AgentPersonalityDraftCreate) -> dict:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Agent name is required")
+
+    seed_personality = (payload.seed_personality or "").strip()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You draft reusable AI agent personality and perspective instructions. "
+                "Return only the personality text, written in second person for the agent. "
+                "Do not include a title, markdown fence, or explanation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Agent name: {name}\n\n"
+                f"User notes or rough personality draft: {seed_personality or '(none)'}\n\n"
+                "Create a polished personality / perspective for this saved agent. "
+                "Make it specific, practical, and usable in multi-agent discussions. "
+                "Keep it to 2-4 concise paragraphs."
+            ),
+        },
+    ]
+
+    with get_connection() as connection:
+        config = _active_llm_model(connection)
+        context_chars = sum(len(str(message.get("content", ""))) for message in messages)
+        started_at = time.perf_counter()
+        try:
+            personality = llm_chat(
+                provider=config["provider"],
+                base_url=config["base_url"],
+                model=config["model"],
+                api_key=config["api_key"],
+                messages=messages,
+            ).strip()
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        generation_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+        if personality:
+            _update_generation_stats(
+                connection,
+                config["provider"],
+                config["model"],
+                generation_ms,
+                context_chars,
+                len(personality),
+            )
+
+    if not personality:
+        raise HTTPException(status_code=502, detail="The default LLM returned an empty draft")
+    return {"personality": personality}
+
+
 @app.put("/api/agent-profiles/{profile_id}", response_model=AgentProfileRead)
 def update_agent_profile_route(profile_id: int, payload: AgentProfileUpdate) -> dict:
     with get_connection() as connection:
@@ -1086,15 +1185,21 @@ def _prompt_config_or_default(connection) -> dict:
     row = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
     if not row:
         connection.execute(
-            "INSERT INTO app_config (id, default_prompt, multi_agent_prompt) VALUES (1, ?, ?)",
-            (DEFAULT_SYSTEM_PROMPT, DEFAULT_MULTI_AGENT_PROMPT),
+            "INSERT INTO app_config (id, default_prompt, multi_agent_prompt, director_prompt) VALUES (1, ?, ?, ?)",
+            (DEFAULT_SYSTEM_PROMPT, DEFAULT_MULTI_AGENT_PROMPT, DEFAULT_DIRECTOR_PROMPT),
         )
         row = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
-    elif not (row.get("multi_agent_prompt") or "").strip():
-        connection.execute(
-            "UPDATE app_config SET multi_agent_prompt = ? WHERE id = 1",
-            (DEFAULT_MULTI_AGENT_PROMPT,),
-        )
+    else:
+        if not (row.get("multi_agent_prompt") or "").strip():
+            connection.execute(
+                "UPDATE app_config SET multi_agent_prompt = ? WHERE id = 1",
+                (DEFAULT_MULTI_AGENT_PROMPT,),
+            )
+        if not (row.get("director_prompt") or "").strip():
+            connection.execute(
+                "UPDATE app_config SET director_prompt = ? WHERE id = 1",
+                (DEFAULT_DIRECTOR_PROMPT,),
+            )
         row = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
     return row
 
@@ -1105,6 +1210,8 @@ def _public_prompt_config(config: dict) -> dict:
         "default_prompt_baseline": DEFAULT_SYSTEM_PROMPT,
         "multi_agent_prompt": (config.get("multi_agent_prompt") or "").strip() or DEFAULT_MULTI_AGENT_PROMPT,
         "multi_agent_prompt_baseline": DEFAULT_MULTI_AGENT_PROMPT,
+        "director_prompt": (config.get("director_prompt") or "").strip() or DEFAULT_DIRECTOR_PROMPT,
+        "director_prompt_baseline": DEFAULT_DIRECTOR_PROMPT,
         "updated_at": config["updated_at"],
     }
 
@@ -1124,16 +1231,19 @@ def update_prompt_config(payload: PromptConfigUpdate) -> dict:
     multi_agent_prompt = payload.multi_agent_prompt.strip()
     if not multi_agent_prompt:
         raise HTTPException(status_code=400, detail="Multi-agent prompt cannot be empty")
+    director_prompt = payload.director_prompt.strip()
+    if not director_prompt:
+        raise HTTPException(status_code=400, detail="Director prompt cannot be empty")
 
     with get_connection() as connection:
         _prompt_config_or_default(connection)
         connection.execute(
             """
             UPDATE app_config
-            SET default_prompt = ?, multi_agent_prompt = ?, updated_at = CURRENT_TIMESTAMP
+            SET default_prompt = ?, multi_agent_prompt = ?, director_prompt = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = 1
             """,
-            (prompt, multi_agent_prompt),
+            (prompt, multi_agent_prompt, director_prompt),
         )
         config = row_to_dict(connection.execute("SELECT * FROM app_config WHERE id = 1").fetchone())
         return _public_prompt_config(config)
@@ -1252,18 +1362,43 @@ def list_conversations() -> List[dict]:
 @app.post("/api/conversations", response_model=Conversation)
 def create_conversation(payload: ConversationCreate) -> dict:
     title = (payload.title or "New Conversation").strip() or "New Conversation"
+    mode = payload.mode or "single"
     with get_connection() as connection:
         active_model = _active_llm_model(connection)
         next_sort_order = connection.execute(
             "SELECT COALESCE(MIN(sort_order), 0) - 1 AS sort_order FROM conversations"
         ).fetchone()["sort_order"]
         cursor = connection.execute(
-            "INSERT INTO conversations (title, sort_order, llm_model_id) VALUES (?, ?, ?)",
-            (title, next_sort_order, active_model["id"]),
+            """
+            INSERT INTO conversations (
+                title, sort_order, llm_model_id, mode, agentic_goal, agentic_success_criteria,
+                agentic_scrape_url, agentic_scrape_depth, agentic_report_format, agentic_status, agentic_max_iterations
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                next_sort_order,
+                active_model["id"],
+                mode,
+                (payload.agentic_goal or "").strip() or None,
+                (payload.agentic_success_criteria or "").strip() or None,
+                (payload.agentic_scrape_url or "").strip() or None,
+                payload.agentic_scrape_depth or 1 if mode == "agentic" else None,
+                (payload.agentic_report_format or "").strip() or None,
+                "idle" if mode == "agentic" else None,
+                payload.agentic_max_iterations or DEFAULT_AGENTIC_MAX_ITERATIONS if mode == "agentic" else None,
+            ),
         )
         conversation_id = cursor.lastrowid
         if payload.participants:
-            replace_participants(connection, conversation_id, payload.participants, _llm_model_or_404)
+            replace_participants(
+                connection,
+                conversation_id,
+                payload.participants,
+                _llm_model_or_404,
+                mode=mode if mode in {"discussion", "agentic"} else "discussion",
+            )
         return _public_conversation(connection, conversation_id)
 
 
@@ -1298,6 +1433,27 @@ def update_conversation_model(conversation_id: int, payload: ConversationModelUp
             WHERE id = ?
             """,
             (payload.llm_model_id, conversation_id),
+        )
+        return _public_conversation(connection, conversation_id)
+
+
+@app.post("/api/conversations/{conversation_id}/agentic-control", response_model=Conversation)
+def control_agentic_conversation(conversation_id: int, payload: AgenticControlRequest) -> dict:
+    with get_connection() as connection:
+        conversation = _conversation_or_404(connection, conversation_id)
+        if (conversation.get("mode") or "single") != "agentic":
+            raise HTTPException(status_code=400, detail="Agentic controls are only available for agentic conversations")
+        status = (conversation.get("agentic_status") or "idle").strip()
+        if status not in {"running", "stop_requested", "wrap_requested"}:
+            raise HTTPException(status_code=400, detail="No agentic process is currently running")
+        next_status = "stop_requested" if payload.action == "stop" else "wrap_requested"
+        connection.execute(
+            """
+            UPDATE conversations
+            SET agentic_status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (next_status, conversation_id),
         )
         return _public_conversation(connection, conversation_id)
 
@@ -1357,22 +1513,100 @@ def delete_conversation(conversation_id: int, payload: ConversationDelete) -> di
 @app.get("/api/conversations/{conversation_id}", response_model=ConversationDetail)
 def get_conversation(conversation_id: int) -> dict:
     with get_connection() as connection:
-        conversation = _conversation_or_404(connection, conversation_id)
-        messages = [dict(row) for row in connection.execute(
-            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id ASC",
-            (conversation_id,),
-        ).fetchall()]
+        conversation = _public_conversation(connection, conversation_id)
+        messages = [
+            _public_message(dict(row))
+            for row in connection.execute(
+                "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+                (conversation_id,),
+            ).fetchall()
+        ]
         memories = _active_memories(connection, conversation_id)
         participants = [public_participant(row) for row in load_participants(connection, conversation_id)]
-        return {"conversation": conversation, "messages": messages, "memories": memories, "participants": participants}
+        documents = load_documents(connection, conversation_id)
+        return {
+            "conversation": conversation,
+            "messages": messages,
+            "memories": memories,
+            "participants": participants,
+            "documents": documents,
+        }
+
+
+def _conversation_detail_payload(connection, conversation_id: int) -> dict:
+    conversation = _public_conversation(connection, conversation_id)
+    messages = [
+        _public_message(dict(row))
+        for row in connection.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+            (conversation_id,),
+        ).fetchall()
+    ]
+    memories = _active_memories(connection, conversation_id)
+    participants = [public_participant(row) for row in load_participants(connection, conversation_id)]
+    documents = load_documents(connection, conversation_id)
+    return {
+        "conversation": conversation,
+        "messages": messages,
+        "memories": memories,
+        "participants": participants,
+        "documents": documents,
+    }
 
 
 @app.put("/api/conversations/{conversation_id}/participants", response_model=List[ConversationParticipantRead])
 def update_conversation_participants(conversation_id: int, payload: ConversationParticipantsUpdate) -> List[dict]:
     with get_connection() as connection:
-        _conversation_or_404(connection, conversation_id)
-        rows = replace_participants(connection, conversation_id, payload.participants, _llm_model_or_404)
+        conversation = _conversation_or_404(connection, conversation_id)
+        mode = payload.mode or conversation.get("mode") or "discussion"
+        rows = replace_participants(
+            connection,
+            conversation_id,
+            payload.participants,
+            _llm_model_or_404,
+            mode=mode if mode in {"discussion", "agentic"} else "discussion",
+        )
         return [public_participant(row) for row in rows]
+
+
+@app.put("/api/conversations/{conversation_id}/agentic-setup", response_model=ConversationDetail)
+def update_agentic_conversation_setup(conversation_id: int, payload: ConversationAgenticSetupUpdate) -> dict:
+    with get_connection() as connection:
+        conversation = _conversation_or_404(connection, conversation_id)
+        if (conversation.get("mode") or "single") != "agentic":
+            raise HTTPException(status_code=400, detail="Agentic setup is only available for agentic conversations")
+
+        replace_participants(
+            connection,
+            conversation_id,
+            payload.participants,
+            _llm_model_or_404,
+            mode="agentic",
+        )
+        connection.execute(
+            """
+            UPDATE conversations
+            SET
+                agentic_goal = ?,
+                agentic_success_criteria = ?,
+                agentic_scrape_url = ?,
+                agentic_scrape_depth = ?,
+                agentic_report_format = ?,
+                agentic_max_iterations = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                payload.agentic_goal.strip(),
+                payload.agentic_success_criteria.strip(),
+                (payload.agentic_scrape_url or "").strip() or None,
+                payload.agentic_scrape_depth,
+                (payload.agentic_report_format or "").strip() or None,
+                payload.agentic_max_iterations,
+                conversation_id,
+            ),
+        )
+        return _conversation_detail_payload(connection, conversation_id)
 
 
 @app.post("/api/conversations/{conversation_id}/llm-context-preview", response_model=LlmContextPreview)
@@ -1393,8 +1627,9 @@ def preview_llm_context(conversation_id: int, payload: MessageCreate) -> dict:
     with get_connection() as connection:
         conversation = _conversation_or_404(connection, conversation_id)
         participants = load_participants(connection, conversation_id)
+        conversation_mode = (conversation.get("mode") or "single").strip() or "single"
         multi_agent_note = None
-        if is_multi_agent_discussion(participants):
+        if conversation_mode == "discussion" or is_multi_agent_discussion(participants):
             preview_model_id = payload.override_llm_model_id or participants[0]["llm_model_id"]
             config = _llm_model_or_404(connection, preview_model_id)
             if payload.override_llm_model_id:
@@ -1451,6 +1686,7 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
 
     with get_connection() as connection:
         conversation = _conversation_or_404(connection, conversation_id)
+        conversation_mode = (conversation.get("mode") or "single").strip() or "single"
 
         if not image_data and normalized == "remember this message":
             source = _latest_assistant_message(connection, conversation_id)
@@ -1466,22 +1702,68 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
             _schedule_memory_title_generation(background_tasks, memory, conversation_id)
             return {"memory": memory}
 
+        if payload.agentic_start and conversation_mode != "agentic":
+            raise HTTPException(status_code=400, detail="agentic_start is only available for agentic conversations")
+
         message_content = content
-        user_message = _insert_message(
-            connection,
-            conversation_id,
-            "user",
-            message_content,
-            image_data=image_data,
-            image_media_type=image_media_type,
-        )
-        if conversation["title"] == "New Conversation":
+        user_message = None
+        if not payload.agentic_start:
+            user_message = _insert_message(
+                connection,
+                conversation_id,
+                "user",
+                message_content,
+                image_data=image_data,
+                image_media_type=image_media_type,
+            )
+
+        if payload.agentic_ad_hoc:
+            if conversation_mode != "agentic":
+                raise HTTPException(status_code=400, detail="Ad-hoc messages are only available for agentic conversations")
+            status = (conversation.get("agentic_status") or "idle").strip()
+            if status not in {"running", "wrap_requested", "stop_requested"}:
+                raise HTTPException(status_code=400, detail="No agentic process is currently running")
+            return {"user_message": user_message}
+
+        if conversation["title"] == "New Conversation" and not payload.agentic_start:
             title_source = content or "Image message"
             title = title_source[:60] + ("..." if len(title_source) > 60 else "")
             connection.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
 
         participants = load_participants(connection, conversation_id)
-        if is_multi_agent_discussion(participants):
+
+        if conversation_mode == "agentic":
+            status = (conversation.get("agentic_status") or "idle").strip()
+            if status in {"running", "wrap_requested", "stop_requested"}:
+                raise HTTPException(status_code=400, detail="Agentic process is already running")
+            prompt_config = _prompt_config_or_default(connection)
+            assistant_messages = run_agentic_turn(
+                connection,
+                conversation_id,
+                conversation,
+                participants,
+                user_message=message_content,
+                include_memories=payload.include_memories,
+                include_all_memories=payload.include_all_memories,
+                answer_length=payload.answer_length,
+                insert_message=_insert_message,
+                update_generation_stats=_update_generation_stats,
+                summarize_llm_context=_summarize_llm_context,
+                llm_model_or_404=_llm_model_or_404,
+                active_memories_fn=_active_memories,
+                all_memories_fn=_all_active_memories,
+                insert_memory_fn=_insert_memory,
+                director_prompt_template=(prompt_config.get("director_prompt") or DEFAULT_DIRECTOR_PROMPT),
+                commit_connection=lambda conn: conn.commit(),
+            )
+            last_message = assistant_messages[-1] if assistant_messages else None
+            return {
+                "user_message": user_message,
+                "assistant_message": last_message,
+                "assistant_messages": assistant_messages,
+            }
+
+        if conversation_mode == "discussion" or is_multi_agent_discussion(participants):
             if payload.override_llm_model_id is not None:
                 _llm_model_or_404(connection, payload.override_llm_model_id)
             discussion_rounds = clamp_discussion_rounds(payload.discussion_rounds)
@@ -1799,6 +2081,164 @@ def merge_memories(conversation_id: int, payload: MemoryMerge, background_tasks:
         return _schedule_memory_title_generation(background_tasks, merged, conversation_id)
 
 
+def _render_document_html(document: dict) -> str:
+    import html
+
+    title = html.escape(document["title"])
+    body = html.escape(document["content_markdown"])
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{title}</title>
+  <style>
+    body {{ font-family: Georgia, 'Times New Roman', serif; max-width: 820px; margin: 40px auto; line-height: 1.6; color: #1f2937; padding: 0 24px; }}
+    pre {{ white-space: pre-wrap; background: #f8fafc; padding: 16px; border-radius: 8px; }}
+    h1 {{ font-size: 2rem; margin-bottom: 0.5rem; }}
+    .meta {{ color: #64748b; font-size: 0.9rem; margin-bottom: 2rem; }}
+  </style>
+</head>
+<body>
+  <h1>{title}</h1>
+  <div class="meta">{html.escape(document.get('kind') or 'document')} · updated {html.escape(document.get('updated_at') or '')}</div>
+  <pre>{body}</pre>
+</body>
+</html>"""
+
+
+@app.get("/api/conversations/{conversation_id}/documents", response_model=List[Document])
+def list_conversation_documents(conversation_id: int) -> List[dict]:
+    with get_connection() as connection:
+        _conversation_or_404(connection, conversation_id)
+        return load_documents(connection, conversation_id)
+
+
+@app.post("/api/conversations/{conversation_id}/documents", response_model=Document)
+def create_conversation_document(conversation_id: int, payload: DocumentCreate) -> dict:
+    with get_connection() as connection:
+        _conversation_or_404(connection, conversation_id)
+        return create_document(
+            connection,
+            conversation_id,
+            title=payload.title,
+            content_markdown=payload.content_markdown,
+            kind=payload.kind,
+        )
+
+
+@app.post("/api/conversations/{conversation_id}/documents/upload", response_model=DocumentUploadResponse)
+async def upload_conversation_document(
+    conversation_id: int,
+    file: UploadFile = File(...),
+) -> dict:
+    with get_connection() as connection:
+        _conversation_or_404(connection, conversation_id)
+        raw_bytes = await file.read()
+        markdown, media_type, metadata = normalize_upload_to_markdown(
+            file.filename or "document.txt",
+            file.content_type or "",
+            raw_bytes,
+        )
+        document = create_document(
+            connection,
+            conversation_id,
+            title=sanitize_filename(file.filename or "Uploaded document"),
+            content_markdown=markdown,
+            kind="uploaded",
+            source_filename=sanitize_filename(file.filename or "document.txt"),
+            source_media_type=media_type,
+            metadata=metadata,
+        )
+        return {"document": document}
+
+
+@app.post("/api/conversations/{conversation_id}/documents/upload-website", response_model=DocumentUploadResponse)
+def upload_conversation_document_from_website(
+    conversation_id: int,
+    payload: DocumentWebsiteUploadRequest,
+) -> dict:
+    with get_connection() as connection:
+        _conversation_or_404(connection, conversation_id)
+
+    try:
+        scrape_result = scrape_website_content(payload.url, depth=payload.depth)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not scrape website: {exc}") from exc
+
+    content = (scrape_result.get("content_markdown") or "").strip()
+    if not content or content == "No readable content extracted.":
+        raise HTTPException(status_code=400, detail="No readable website content was extracted")
+
+    structures = scrape_result.get("structure") or []
+    scraped_title = ""
+    if structures and isinstance(structures[0], dict):
+        scraped_title = (structures[0].get("title") or "").strip()
+    title = (payload.title or "").strip() or scraped_title or scrape_result["url"]
+    metadata = {
+        "source": "website",
+        "url": scrape_result["url"],
+        "depth": scrape_result["depth"],
+        "pages_scraped": scrape_result["pages_scraped"],
+        "page_urls": scrape_result["page_urls"],
+        "rendered_pages": scrape_result.get("rendered_pages", 0),
+        "render_errors": scrape_result.get("render_errors", []),
+        "extracted_chars": scrape_result["extracted_chars"],
+    }
+
+    with get_connection() as connection:
+        document = create_document(
+            connection,
+            conversation_id,
+            title=title,
+            content_markdown=content,
+            kind="uploaded",
+            source_filename=scrape_result["url"],
+            source_media_type="text/markdown",
+            metadata=metadata,
+        )
+        return {"document": document}
+
+
+@app.get("/api/conversations/{conversation_id}/documents/{document_id}", response_model=Document)
+def get_conversation_document(conversation_id: int, document_id: int) -> dict:
+    with get_connection() as connection:
+        return document_or_404(connection, conversation_id, document_id)
+
+
+@app.put("/api/conversations/{conversation_id}/documents/{document_id}", response_model=Document)
+def update_conversation_document(conversation_id: int, document_id: int, payload: DocumentUpdate) -> dict:
+    with get_connection() as connection:
+        return update_document(
+            connection,
+            conversation_id,
+            document_id,
+            title=payload.title,
+            content_markdown=payload.content_markdown,
+        )
+
+
+@app.delete("/api/conversations/{conversation_id}/documents/{document_id}")
+def delete_conversation_document(conversation_id: int, document_id: int) -> dict:
+    with get_connection() as connection:
+        archive_document(connection, conversation_id, document_id)
+        return {"ok": True}
+
+
+@app.get("/api/conversations/{conversation_id}/documents/{document_id}/pdf")
+def download_conversation_document_pdf(conversation_id: int, document_id: int) -> Response:
+    with get_connection() as connection:
+        document = document_or_404(connection, conversation_id, document_id)
+    html = _render_document_html(document)
+    filename = sanitize_filename(document["title"]) + ".html"
+    return Response(
+        content=html,
+        media_type="text/html",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
 def _usage_date_filter(days: Optional[int]) -> tuple[str, list]:
     if days is not None and days > 0:
         return "AND created_at >= datetime('now', ?)", [f"-{int(days)} days"]
@@ -1869,22 +2309,55 @@ def _load_usage_stats(connection, days: Optional[int] = None) -> dict:
         message_date_params,
     ).fetchall()
 
+    daily_model_rows = connection.execute(
+        f"""
+        SELECT
+            DATE(created_at) AS bucket_date,
+            COALESCE(NULLIF(TRIM(llm_provider), ''), 'unknown') AS provider,
+            COALESCE(NULLIF(TRIM(llm_model), ''), 'unknown') AS model,
+            COUNT(*) AS message_count
+        FROM messages
+        WHERE role = 'assistant'
+        {message_date_filter}
+        GROUP BY bucket_date, provider, model
+        ORDER BY bucket_date ASC, message_count DESC, model ASC
+        """,
+        message_date_params,
+    ).fetchall()
+
+    daily_model_lookup: dict[str, list[dict]] = {}
+    for row in daily_model_rows:
+        provider = row["provider"]
+        model = row["model"]
+        daily_model_lookup.setdefault(row["bucket_date"], []).append(
+            {
+                "provider": provider,
+                "model": model,
+                "label": f"{provider} / {model}" if provider != "unknown" else model,
+                "message_count": int(row["message_count"]),
+            }
+        )
+
     daily_lookup = {
         row["bucket_date"]: {
             "date": row["bucket_date"],
             "user_messages": int(row["user_messages"]),
             "assistant_messages": int(row["assistant_messages"]),
             "total_messages": int(row["total_messages"]),
+            "model_requests": daily_model_lookup.get(row["bucket_date"], []),
         }
         for row in daily_rows
     }
 
     daily: list[dict] = []
-    if daily_lookup:
-        start_date = min(daily_lookup.keys())
-        end_date = max(daily_lookup.keys())
-        cursor = date.fromisoformat(start_date)
-        end = date.fromisoformat(end_date)
+    if daily_lookup or days is not None:
+        today = date.today()
+        if days is not None:
+            cursor = today - timedelta(days=max(int(days), 1) - 1)
+            end = today
+        else:
+            cursor = date.fromisoformat(min(daily_lookup.keys()))
+            end = date.fromisoformat(max(daily_lookup.keys()))
         while cursor <= end:
             key = cursor.isoformat()
             daily.append(
@@ -1895,6 +2368,7 @@ def _load_usage_stats(connection, days: Optional[int] = None) -> dict:
                         "user_messages": 0,
                         "assistant_messages": 0,
                         "total_messages": 0,
+                        "model_requests": [],
                     },
                 )
             )

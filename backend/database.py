@@ -14,6 +14,60 @@ DEFAULT_SYSTEM_PROMPT = (
     "when it is relevant, and be clear when you are unsure."
 )
 
+DEFAULT_AGENTIC_MAX_ITERATIONS = 20
+
+DEFAULT_DIRECTOR_PROMPT = """You are the Director — the project lead orchestrating a team of specialist agents to achieve a defined goal.
+
+Goal:
+{goal}
+
+Success criteria:
+{success_criteria}
+
+Report format preference:
+{report_format}
+
+Available specialists (you may only delegate to these agents):
+{agent_list}
+
+Conversation documents:
+{document_list}
+
+Optional website for research scraping:
+{scrape_url}
+
+Your responsibilities:
+- Plan, delegate, evaluate, and synthesize. You are not a roundtable participant.
+- After every tool result or agent response, assess progress against the success criteria.
+- Identify gaps explicitly before choosing the next action.
+- Use concise, user-visible rationale — not hidden chain-of-thought.
+- Delegate focused task packets to specialists; they only see what you send them.
+- Use memories and documents as evidence; cite sources in summaries and reports.
+- Generate a Markdown task report when the deliverable warrants it or the user requested a format.
+- Stop when success criteria are met, the user asks to stop, or iteration budget is exhausted.
+- Do not ask the user questions. If information is missing, proceed with explicit assumptions or use available specialists/tools.
+- Treat user messages added while you are running as ad-hoc clarifications. Incorporate them into the next step, but do not pause for more input.
+
+Respond with a single JSON object for your next action:
+{{
+  "action": "search_conversation_memories | search_all_memories | search_documents | read_document | scrape_website | call_agent | generate_report | complete",
+  "rationale": "short user-visible reason",
+  "arguments": {{}},
+  "expected_result": "what this action should clarify",
+  "criteria_addressed": ["criterion labels"]
+}}
+
+Action argument schemas:
+- search_conversation_memories: {{"query": "optional string"}}
+- search_all_memories: {{"query": "optional string"}}
+- search_documents: {{"query": "optional string"}}
+- read_document: {{"document_id": number}}
+- scrape_website: {{"query": "focus query for extraction"}}
+- call_agent: {{"participant_id": number, "task": "delegated work packet", "expected_output": "shape of answer"}}
+- generate_report: {{"title": "string", "format_request": "optional format", "include_provenance": true}}
+- complete: {{"final_answer": "string", "success_assessment": "string", "success_score": 0-100, "remaining_gaps": ["optional"]}}
+"""
+
 DEFAULT_MULTI_AGENT_PROMPT = """The conversation is inspired by public themes associated with well-known motivational, personal development, and spiritual teachers, but you must not claim to literally be any real person. You are an educational and reflective simulation.
 
 Your job is to help the user think deeply, honestly, and practically about their life, goals, fears, relationships, work, meaning, habits, and inner growth.
@@ -189,6 +243,21 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('uploaded', 'generated_report')),
+                content_markdown TEXT NOT NULL,
+                source_filename TEXT,
+                source_media_type TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                archived_at TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
             """
         )
         _ensure_column(connection, "conversations", "sort_order", "INTEGER")
@@ -216,6 +285,19 @@ def init_db() -> None:
         _ensure_column(connection, "speech_config", "elevenlabs_api_key", "TEXT")
         _ensure_column(connection, "viz_specs", "client_state_json", "TEXT")
         _ensure_column(connection, "viz_specs", "updated_at", "TEXT")
+        _ensure_column(connection, "conversations", "mode", "TEXT")
+        _ensure_column(connection, "conversations", "agentic_goal", "TEXT")
+        _ensure_column(connection, "conversations", "agentic_success_criteria", "TEXT")
+        _ensure_column(connection, "conversations", "agentic_scrape_url", "TEXT")
+        _ensure_column(connection, "conversations", "agentic_scrape_depth", "INTEGER")
+        _ensure_column(connection, "conversations", "agentic_report_format", "TEXT")
+        _ensure_column(connection, "conversations", "agentic_status", "TEXT")
+        _ensure_column(connection, "conversations", "agentic_max_iterations", "INTEGER")
+        _ensure_column(connection, "messages", "message_kind", "TEXT")
+        _ensure_column(connection, "messages", "metadata_json", "TEXT")
+        _ensure_column(connection, "messages", "parent_message_id", "INTEGER")
+        _ensure_column(connection, "app_config", "director_prompt", "TEXT")
+        _backfill_conversation_modes(connection)
         _backfill_memory_titles(connection)
         _ensure_column(connection, "memories", "title_generated_at", "TEXT")
         _backfill_memory_title_generated_at(connection)
@@ -269,6 +351,31 @@ def _backfill_memory_title_generated_at(connection: sqlite3.Connection) -> None:
         SET title_generated_at = created_at
         WHERE title_generated_at IS NULL
         """
+    )
+
+
+def _backfill_conversation_modes(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT id, mode FROM conversations WHERE mode IS NULL OR TRIM(mode) = ''"
+    ).fetchall()
+    for row in rows:
+        count = connection.execute(
+            "SELECT COUNT(*) AS count FROM conversation_participants WHERE conversation_id = ?",
+            (row["id"],),
+        ).fetchone()["count"]
+        mode = "discussion" if int(count) > 1 else "single"
+        connection.execute(
+            "UPDATE conversations SET mode = ? WHERE id = ?",
+            (mode, row["id"]),
+        )
+    connection.execute(
+        """
+        UPDATE conversations
+        SET agentic_status = COALESCE(agentic_status, 'idle'),
+            agentic_max_iterations = COALESCE(agentic_max_iterations, ?)
+        WHERE mode = 'agentic' OR agentic_status IS NULL
+        """,
+        (DEFAULT_AGENTIC_MAX_ITERATIONS,),
     )
 
 

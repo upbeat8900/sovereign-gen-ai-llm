@@ -2,3 +2,10 @@ fastapi
 uvicorn[standard]
 python-multipart
 faster-whisper
+langchain-core
+httpx
+beautifulsoup4
+playwright
+pymupdf
+pymupdf4llm
+pytest

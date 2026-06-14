@@ -19,6 +19,7 @@ import {
   Brain,
   Check,
   FileDown,
+  FileText,
   GripVertical,
   ImagePlus,
   Loader2,
@@ -38,7 +39,7 @@ import {
 } from "lucide-react";
 
 
-type Page = "chat" | "memories" | "settings" | "stats";
+type Page = "chat" | "memories" | "documents" | "settings" | "stats";
 type VizSpecSummary = {
   viz_id: string;
   conversation_id: number;
@@ -59,6 +60,14 @@ type Conversation = {
   sort_order: number;
   llm_model_id?: number | null;
   participant_count?: number;
+  mode?: "single" | "discussion" | "agentic";
+  agentic_goal?: string | null;
+  agentic_success_criteria?: string | null;
+  agentic_scrape_url?: string | null;
+  agentic_scrape_depth?: number | null;
+  agentic_report_format?: string | null;
+  agentic_status?: string | null;
+  agentic_max_iterations?: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -121,7 +130,23 @@ type Message = {
   generation_ms?: number | null;
   include_history?: boolean | number | null;
   participant_id?: number | null;
+  message_kind?: string | null;
+  metadata?: Record<string, unknown> | null;
+  parent_message_id?: number | null;
   created_at: string;
+};
+
+type DocumentItem = {
+  id: number;
+  conversation_id: number;
+  title: string;
+  kind: "uploaded" | "generated_report" | "generated_process";
+  content_markdown: string;
+  source_filename?: string | null;
+  source_media_type?: string | null;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
 };
 
 type PendingImage = {
@@ -149,6 +174,7 @@ type ConversationDetail = {
   messages: Message[];
   memories: Memory[];
   participants: ConversationParticipant[];
+  documents?: DocumentItem[];
 };
 
 type MemoryGroup = {
@@ -193,6 +219,8 @@ type PromptConfig = {
   default_prompt_baseline: string;
   multi_agent_prompt: string;
   multi_agent_prompt_baseline: string;
+  director_prompt: string;
+  director_prompt_baseline: string;
   updated_at: string;
 };
 
@@ -211,6 +239,7 @@ type UsageDailyBucket = {
   user_messages: number;
   assistant_messages: number;
   total_messages: number;
+  model_requests?: UsageModelBucket[];
 };
 
 type UsageModelBucket = {
@@ -994,6 +1023,7 @@ function filterVisibleChatMessages(
   messages: Message[],
   options: {
     isMultiAgent: boolean;
+    isAgentic: boolean;
     isGenerating: boolean;
     allowSinglePlaceholder: boolean;
   },
@@ -1003,10 +1033,13 @@ function filterVisibleChatMessages(
     if (message.role !== "assistant") {
       return true;
     }
+    if (message.message_kind && message.message_kind !== "agent_reply" && message.message_kind !== "director_final") {
+      return true;
+    }
     if (assistantMessageHasVisibleContent(message)) {
       return true;
     }
-    if (options.isMultiAgent) {
+    if (options.isMultiAgent || options.isAgentic) {
       return false;
     }
     if (!options.isGenerating || !options.allowSinglePlaceholder || message.id >= 0) {
@@ -1058,12 +1091,50 @@ function participantDisplayName(participant: ConversationParticipant | Participa
 
 function messageSpeakerLabel(message: Message, participants: ConversationParticipant[], models: LlmModel[]) {
   if (message.role !== "assistant") return "You";
+  if (message.message_kind?.startsWith("director_")) return "Director";
   if (message.participant_id != null) {
     const participant = participants.find((item) => item.id === message.participant_id);
     if (participant) return participantDisplayName(participant, models);
   }
   if (message.llm_model) return message.llm_model;
   return "Assistant";
+}
+
+function directorStepLabel(messageKind?: string | null) {
+  switch (messageKind) {
+    case "director_rationale":
+      return "Director rationale";
+    case "director_tool":
+      return "Director tool";
+    case "director_delegation":
+      return "Director delegation";
+    case "director_clarification":
+      return "Director clarification";
+    case "director_synthesis":
+      return "Director synthesis";
+    case "director_evaluation":
+      return "Director evaluation";
+    case "director_document":
+      return "Generated report";
+    case "director_final":
+      return "Director final";
+    case "director_error":
+      return "Director error";
+    case "agent_reply":
+      return "Agent reply";
+    default:
+      return "Director step";
+  }
+}
+
+function isDirectorStepMessage(message: Message) {
+  return Boolean(message.message_kind?.startsWith("director_"));
+}
+
+function documentKindLabel(kind: DocumentItem["kind"]) {
+  if (kind === "generated_report") return "Generated output";
+  if (kind === "generated_process") return "Process/rationale";
+  return "Uploaded document";
 }
 
 function assistantUsedCurrentMessageOnly(message: Message) {
@@ -1106,9 +1177,11 @@ type GenerationJob = {
   contextPreview: LlmContextPreview | null;
   startedAt: number;
   isMultiAgent?: boolean;
+  isAgentic?: boolean;
   totalSteps?: number;
   completedSteps?: number;
   currentParticipantName?: string;
+  currentStepLabel?: string;
   initialMessageCount?: number;
   speakReplies?: boolean;
   autoPlayReplies?: boolean;
@@ -1203,6 +1276,8 @@ function AgentProfileFields({
   agentProfiles,
   ttsVoiceOptions,
   onPlayVoiceSample,
+  onGeneratePersonality,
+  generatingPersonality = false,
   expandedPersonality = false,
 }: {
   draft: ParticipantDraft;
@@ -1211,6 +1286,8 @@ function AgentProfileFields({
   agentProfiles: AgentProfile[];
   ttsVoiceOptions: TtsVoiceOption[];
   onPlayVoiceSample: (voiceUri?: string, speechRate?: number) => void;
+  onGeneratePersonality?: () => void | Promise<void>;
+  generatingPersonality?: boolean;
   expandedPersonality?: boolean;
 }) {
   return (
@@ -1297,16 +1374,39 @@ function AgentProfileFields({
           Use global speed
         </label>
       </div>
-      <label className={expandedPersonality ? "agent-personality-field" : undefined}>
-        Personality / perspective
+      <div className="agent-personality-field">
+        <span className="agent-personality-label-row">
+          <span>Personality / perspective</span>
+          {onGeneratePersonality ? (
+            <button
+              type="button"
+              className="secondary-button agent-personality-draft-button"
+              disabled={generatingPersonality || !draft.name.trim()}
+              onClick={() => void onGeneratePersonality()}
+            >
+              {generatingPersonality ? (
+                <>
+                  <Loader2 size={16} className="spin" />
+                  Drafting...
+                </>
+              ) : (
+                <>
+                  <Sparkles size={16} />
+                  Draft with LLM
+                </>
+              )}
+            </button>
+          ) : null}
+        </span>
         <textarea
+          aria-label="Personality / perspective"
           className={expandedPersonality ? "agent-personality-textarea" : undefined}
           rows={expandedPersonality ? 16 : 4}
           value={draft.personality}
           placeholder={`Optional vision for ${participantDisplayName(draft, models)}`}
           onChange={(event) => onChange({ personality: event.target.value })}
         />
-      </label>
+      </div>
     </div>
   );
 }
@@ -1321,6 +1421,7 @@ function ParticipantEditor({
   onUpdateProfile,
   onPlayVoiceSample,
   savingProfileIndex,
+  maxParticipants = 3,
 }: {
   participants: ParticipantDraft[];
   onChange: (next: ParticipantDraft[]) => void;
@@ -1331,6 +1432,7 @@ function ParticipantEditor({
   onUpdateProfile: (index: number) => void | Promise<void>;
   onPlayVoiceSample: (voiceUri?: string, speechRate?: number) => void;
   savingProfileIndex?: number | null;
+  maxParticipants?: number | null;
 }) {
   const [expandedIndex, setExpandedIndex] = useState<number | null>(0);
 
@@ -1358,7 +1460,7 @@ function ParticipantEditor({
   }
 
   function addParticipant() {
-    if (participants.length >= 3) return;
+    if (maxParticipants != null && participants.length >= maxParticipants) return;
     onChange([...participants, createParticipantDraft(models, participants.length)]);
     setExpandedIndex(participants.length);
   }
@@ -1493,7 +1595,7 @@ function ParticipantEditor({
           );
         })}
       </div>
-      {participants.length < 3 && (
+      {(maxParticipants == null || participants.length < maxParticipants) && (
         <button type="button" className="secondary-button participant-add" onClick={addParticipant}>
           <Plus size={16} />
           Add agent
@@ -1527,39 +1629,115 @@ function formatUsageDayLabel(value: string) {
   return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+function formatUsageHistogramDate(value: string) {
+  const parsed = new Date(`${value}T12:00:00`);
+  if (Number.isNaN(parsed.getTime())) return { weekday: "", date: value };
+  return {
+    weekday: parsed.toLocaleDateString(undefined, { weekday: "short" }),
+    date: parsed.toLocaleDateString(undefined, { day: "2-digit", month: "long" }),
+  };
+}
+
+function usageDailyColumnWidth(dayCount: number) {
+  if (dayCount <= 7) return 72;
+  if (dayCount <= 14) return 60;
+  if (dayCount <= 31) return 52;
+  return 44;
+}
+
+const USAGE_MODEL_COLORS = [
+  "#2563eb",
+  "#7c3aed",
+  "#16a34a",
+  "#ea580c",
+  "#0891b2",
+  "#db2777",
+  "#4f46e5",
+  "#ca8a04",
+  "#059669",
+  "#dc2626",
+];
+
+function usageModelColor(label: string) {
+  let hash = 0;
+  for (let index = 0; index < label.length; index += 1) {
+    hash = (hash * 31 + label.charCodeAt(index)) % USAGE_MODEL_COLORS.length;
+  }
+  return USAGE_MODEL_COLORS[Math.abs(hash)];
+}
+
+function usageDailyModelRequests(bucket: UsageDailyBucket) {
+  if (bucket.model_requests?.length) return bucket.model_requests;
+  if (bucket.assistant_messages > 0) {
+    return [{ provider: "unknown", model: "unknown", label: "Unknown model", message_count: bucket.assistant_messages }];
+  }
+  return [];
+}
+
 function UsageDailyChart({ daily }: { daily: UsageDailyBucket[] }) {
   if (!daily.length) {
     return <p className="usage-empty">No message activity in this period.</p>;
   }
 
-  const maxTotal = Math.max(...daily.map((bucket) => bucket.total_messages), 1);
-  const showEveryLabel = daily.length <= 14;
-  const labelStep = showEveryLabel ? 1 : Math.ceil(daily.length / 8);
+  const columnWidth = usageDailyColumnWidth(daily.length);
+  const modelTotals = new Map<string, number>();
+  const requestTotals = daily.map((bucket) => {
+    const modelRequests = usageDailyModelRequests(bucket);
+    const total = modelRequests.reduce((sum, item) => sum + item.message_count, 0);
+    modelRequests.forEach((item) => {
+      modelTotals.set(item.label, (modelTotals.get(item.label) ?? 0) + item.message_count);
+    });
+    return total;
+  });
+  const maxTotal = Math.max(...requestTotals, 1);
+  const legendItems = Array.from(modelTotals.entries()).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
 
   return (
     <div className="usage-daily-chart">
-      <div className="usage-daily-bars" role="img" aria-label="Daily message activity chart">
+      <div
+        className="usage-daily-bars"
+        role="img"
+        aria-label="Daily model request activity chart"
+        style={{ "--usage-column-width": `${columnWidth}px` } as React.CSSProperties}
+      >
         {daily.map((bucket, index) => {
-          const totalHeight = (bucket.total_messages / maxTotal) * 100;
-          const userHeight = bucket.total_messages ? (bucket.user_messages / bucket.total_messages) * totalHeight : 0;
-          const assistantHeight = totalHeight - userHeight;
+          const modelRequests = usageDailyModelRequests(bucket);
+          const requestTotal = requestTotals[index];
+          const totalHeight = (requestTotal / maxTotal) * 100;
+          const label = formatUsageHistogramDate(bucket.date);
+          const titleModels = modelRequests.map((item) => `${item.label}: ${formatUsageNumber(item.message_count)}`).join(", ");
           return (
-            <div key={bucket.date} className="usage-daily-bar-column" title={`${formatUsageDayLabel(bucket.date)}: ${bucket.user_messages} sent, ${bucket.assistant_messages} replies`}>
-              <div className="usage-daily-bar-stack" style={{ height: `${Math.max(totalHeight, bucket.total_messages ? 4 : 0)}%` }}>
-                {assistantHeight > 0 && <span className="usage-daily-bar-segment usage-daily-bar-assistant" style={{ flexGrow: assistantHeight }} />}
-                {userHeight > 0 && <span className="usage-daily-bar-segment usage-daily-bar-user" style={{ flexGrow: userHeight }} />}
+            <div
+              key={bucket.date}
+              className="usage-daily-bar-column"
+              title={`${formatUsageDayLabel(bucket.date)}: ${formatUsageNumber(requestTotal)} requests${titleModels ? ` (${titleModels})` : ""}`}
+            >
+              <div className="usage-daily-bar-plot">
+                <div className="usage-daily-bar-stack" style={{ height: `${Math.max(totalHeight, requestTotal ? 4 : 0)}%` }}>
+                  {modelRequests.map((item) => (
+                    <span
+                      key={`${bucket.date}-${item.provider}-${item.model}`}
+                      className="usage-daily-bar-segment"
+                      style={{ background: usageModelColor(item.label), flexGrow: item.message_count }}
+                    />
+                  ))}
+                </div>
               </div>
-              {(index % labelStep === 0 || index === daily.length - 1) && (
-                <span className="usage-daily-bar-label">{formatUsageDayLabel(bucket.date)}</span>
-              )}
+              <div className="usage-daily-bar-label">
+                <span>{label.weekday}</span>
+                <span>{label.date}</span>
+              </div>
             </div>
           );
         })}
       </div>
-      <div className="usage-chart-legend">
-        <span><i className="usage-legend-swatch usage-legend-user" /> Your messages</span>
-        <span><i className="usage-legend-swatch usage-legend-assistant" /> AI replies</span>
-      </div>
+      {legendItems.length > 0 && (
+        <div className="usage-chart-legend">
+          {legendItems.map(([label]) => (
+            <span key={label}><i className="usage-legend-swatch" style={{ background: usageModelColor(label) }} /> {label}</span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1619,18 +1797,29 @@ export default function App() {
   const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
   const [newTitle, setNewTitle] = useState("");
   const [isNewConversationModalOpen, setIsNewConversationModalOpen] = useState(false);
-  const [newConversationMode, setNewConversationMode] = useState<"single" | "multi">("single");
+  const [newConversationMode, setNewConversationMode] = useState<"single" | "discussion" | "agentic">("single");
   const [newConversationSingleCharacterId, setNewConversationSingleCharacterId] = useState<number | null>(null);
   const [newConversationParticipants, setNewConversationParticipants] = useState<ParticipantDraft[]>([]);
+  const [newAgenticGoal, setNewAgenticGoal] = useState("");
+  const [newAgenticSuccessCriteria, setNewAgenticSuccessCriteria] = useState("");
+  const [newAgenticScrapeUrl, setNewAgenticScrapeUrl] = useState("");
+  const [newAgenticScrapeDepth, setNewAgenticScrapeDepth] = useState(1);
+  const [newAgenticReportFormat, setNewAgenticReportFormat] = useState("");
+  const [newAgenticMaxIterations, setNewAgenticMaxIterations] = useState(20);
+  const [newAgenticInputDocumentTitle, setNewAgenticInputDocumentTitle] = useState("");
+  const [newAgenticInputDocumentContent, setNewAgenticInputDocumentContent] = useState("");
   const [isParticipantsModalOpen, setIsParticipantsModalOpen] = useState(false);
+  const [isAgenticSetupModalOpen, setIsAgenticSetupModalOpen] = useState(false);
   const [participantsDraft, setParticipantsDraft] = useState<ParticipantDraft[]>([]);
   const [savingParticipants, setSavingParticipants] = useState(false);
+  const [savingAgenticSetup, setSavingAgenticSetup] = useState(false);
   const [agentProfiles, setAgentProfiles] = useState<AgentProfile[]>([]);
   const [savingAgentProfileIndex, setSavingAgentProfileIndex] = useState<number | null>(null);
   const [editingAgentProfile, setEditingAgentProfile] = useState<AgentProfile | null>(null);
   const [isCreatingAgentProfile, setIsCreatingAgentProfile] = useState(false);
   const [agentProfileEditDraft, setAgentProfileEditDraft] = useState<ParticipantDraft | null>(null);
   const [savingAgentProfileEdit, setSavingAgentProfileEdit] = useState(false);
+  const [generatingAgentPersonality, setGeneratingAgentPersonality] = useState(false);
   const [participantEditorTarget, setParticipantEditorTarget] = useState<"new" | "edit">("new");
   const [discussionRounds, setDiscussionRounds] = useState(readStoredDiscussionRounds);
   const [multiAgentModelOverrideId, setMultiAgentModelOverrideId] = useState<number | null>(null);
@@ -1690,6 +1879,16 @@ export default function App() {
   const [promptConfig, setPromptConfig] = useState<PromptConfig | null>(null);
   const [defaultPromptDraft, setDefaultPromptDraft] = useState("");
   const [defaultMultiAgentPromptDraft, setDefaultMultiAgentPromptDraft] = useState("");
+  const [directorPromptDraft, setDirectorPromptDraft] = useState("");
+  const [selectedDocument, setSelectedDocument] = useState<DocumentItem | null>(null);
+  const [documentSearch, setDocumentSearch] = useState("");
+  const [documentUploadBusy, setDocumentUploadBusy] = useState(false);
+  const [documentWebsiteUploadBusy, setDocumentWebsiteUploadBusy] = useState(false);
+  const [documentWebsiteUrl, setDocumentWebsiteUrl] = useState("");
+  const [documentWebsiteTitle, setDocumentWebsiteTitle] = useState("");
+  const [documentWebsiteDepth, setDocumentWebsiteDepth] = useState(1);
+  const documentUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const composerDocumentUploadRef = useRef<HTMLInputElement | null>(null);
   const [ttsVoiceOptions, setTtsVoiceOptions] = useState<TtsVoiceOption[]>([]);
   const [selectedTtsVoiceUri, setSelectedTtsVoiceUri] = useState(
     () => localStorage.getItem(TTS_VOICE_STORAGE_KEY) ?? "",
@@ -1850,13 +2049,17 @@ export default function App() {
   }, [config, detail?.conversation.llm_model_id]);
   const activeModelName = conversationModel?.model ?? config?.active_model.model ?? "qwen3.5:9b";
   const activeParticipants = detail?.participants ?? [];
-  const isMultiAgentConversation = activeParticipants.length > 1;
+  const conversationMode = detail?.conversation.mode ?? (activeParticipants.length > 1 ? "discussion" : "single");
+  const isDiscussionConversation = conversationMode === "discussion";
+  const isAgenticConversation = conversationMode === "agentic";
+  const isMultiAgentConversation = isDiscussionConversation && activeParticipants.length > 1;
   const multiAgentOverrideModel = useMemo(() => {
     if (multiAgentModelOverrideId == null) return null;
     return config?.models.find((model) => model.id === multiAgentModelOverrideId) ?? null;
   }, [config?.models, multiAgentModelOverrideId]);
   const activeConversationGenerating = activeId != null && activeId in generationJobs;
   const activeGenerationJob = activeId != null ? generationJobs[activeId] : undefined;
+  const canSendAgenticAdHoc = Boolean(activeGenerationJob?.isAgentic);
   const progressModalJob =
     progressModalConversationId != null ? generationJobs[progressModalConversationId] ?? null : null;
   const progressModalElapsedSec = progressModalJob
@@ -1869,7 +2072,7 @@ export default function App() {
     const job = activeId != null ? generationJobs[activeId] : undefined;
     let messages = base;
 
-    if (job && activeId && !job.isMultiAgent) {
+    if (job && activeId && !job.isMultiAgent && !job.isAgentic) {
       const last = messages[messages.length - 1];
       const hasPendingPlaceholder =
         last?.role === "assistant" && !last.content && last.id < 0;
@@ -1890,10 +2093,23 @@ export default function App() {
 
     return filterVisibleChatMessages(messages, {
       isMultiAgent: isMultiAgentConversation,
+      isAgentic: isAgenticConversation,
       isGenerating: Boolean(job),
-      allowSinglePlaceholder: Boolean(job && !job.isMultiAgent),
+      allowSinglePlaceholder: Boolean(job && !job.isMultiAgent && !job.isAgentic),
     });
-  }, [detail?.messages, activeId, generationJobs, isMultiAgentConversation]);
+  }, [detail?.messages, activeId, generationJobs, isMultiAgentConversation, isAgenticConversation]);
+  const visibleDocuments = useMemo(() => {
+    const documents = detail?.documents ?? [];
+    const needle = documentSearch.trim().toLowerCase();
+    if (!needle) return documents;
+    return documents.filter(
+      (document) =>
+        document.title.toLowerCase().includes(needle) ||
+        document.content_markdown.toLowerCase().includes(needle) ||
+        document.kind.toLowerCase().includes(needle),
+    );
+  }, [detail?.documents, documentSearch]);
+
   const historyContextOverhead = llmContextOverhead(
     detail?.memories.length ?? 0,
     includeMemories,
@@ -1963,7 +2179,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (activeId == null || !isMultiAgentConversation) {
+    if (activeId == null || (!isMultiAgentConversation && !isAgenticConversation)) {
       setMultiAgentModelOverrideId(null);
       return;
     }
@@ -1976,7 +2192,7 @@ export default function App() {
       localStorage.removeItem(multiAgentModelOverrideStorageKey(activeId));
     }
     setMultiAgentModelOverrideId(null);
-  }, [activeId, isMultiAgentConversation, config?.models]);
+  }, [activeId, isMultiAgentConversation, isAgenticConversation, config?.models]);
 
   useEffect(() => {
     loadConversations();
@@ -2035,10 +2251,10 @@ export default function App() {
   }, [generationJobs]);
 
   useEffect(() => {
-    if (!Object.values(generationJobs).some((job) => job.isMultiAgent)) return;
+    if (!Object.values(generationJobs).some((job) => job.isMultiAgent || job.isAgentic)) return;
     const pollGeneratingConversations = () => {
       Object.values(generationJobsRef.current)
-        .filter((job) => job.isMultiAgent)
+        .filter((job) => job.isMultiAgent || job.isAgentic)
         .forEach((job) => {
           void loadConversation(job.conversationId);
         });
@@ -2051,7 +2267,7 @@ export default function App() {
   useEffect(() => {
     if (
       isNewConversationModalOpen &&
-      newConversationMode === "multi" &&
+      (newConversationMode === "discussion" || newConversationMode === "agentic") &&
       config?.models.length &&
       !newConversationParticipants.length
     ) {
@@ -2874,11 +3090,13 @@ export default function App() {
         body: JSON.stringify({
           default_prompt: defaultPromptDraft,
           multi_agent_prompt: defaultMultiAgentPromptDraft,
+          director_prompt: directorPromptDraft,
         }),
       });
       setPromptConfig(saved);
       setDefaultPromptDraft(saved.default_prompt);
       setDefaultMultiAgentPromptDraft(saved.multi_agent_prompt);
+      setDirectorPromptDraft(saved.director_prompt);
       showSettingsSaveSuccess("Default prompts saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save default prompt");
@@ -2893,6 +3111,88 @@ export default function App() {
   function resetDefaultMultiAgentPrompt() {
     const baseline = promptConfig?.multi_agent_prompt_baseline ?? "";
     setDefaultMultiAgentPromptDraft(baseline);
+  }
+
+  function resetDirectorPrompt() {
+    const baseline = promptConfig?.director_prompt_baseline ?? "";
+    setDirectorPromptDraft(baseline);
+  }
+
+  async function uploadDocument(file: File, conversationId: number) {
+    const formData = new FormData();
+    formData.append("file", file);
+    setDocumentUploadBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/documents/upload`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || "Upload failed");
+      }
+      const payload = (await response.json()) as { document: DocumentItem };
+      if (activeId === conversationId) {
+        await loadConversation(conversationId);
+      }
+      setSelectedDocument(payload.document);
+      setNotice(`Uploaded ${payload.document.title}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not upload document");
+    } finally {
+      setDocumentUploadBusy(false);
+    }
+  }
+
+  async function uploadWebsiteDocument(event: FormEvent) {
+    event.preventDefault();
+    if (!activeId) return;
+    const url = documentWebsiteUrl.trim();
+    if (!url) {
+      setError("Enter a website URL to import.");
+      return;
+    }
+    setDocumentWebsiteUploadBusy(true);
+    setError("");
+    try {
+      const payload = await request<{ document: DocumentItem }>(
+        `/api/conversations/${activeId}/documents/upload-website`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            url,
+            title: documentWebsiteTitle.trim() || undefined,
+            depth: documentWebsiteDepth,
+          }),
+        },
+      );
+      await loadConversation(activeId);
+      setSelectedDocument(payload.document);
+      setDocumentWebsiteUrl("");
+      setDocumentWebsiteTitle("");
+      setDocumentWebsiteDepth(1);
+      setNotice(`Imported ${payload.document.title}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not import website");
+    } finally {
+      setDocumentWebsiteUploadBusy(false);
+    }
+  }
+
+  function openDocumentPdf(document: DocumentItem) {
+    window.open(`/api/conversations/${document.conversation_id}/documents/${document.id}/pdf`, "_blank", "noopener,noreferrer");
+  }
+
+  async function createPastedInputDocument(conversationId: number, title: string, content: string) {
+    return request<DocumentItem>(`/api/conversations/${conversationId}/documents`, {
+      method: "POST",
+      body: JSON.stringify({
+        title: title.trim() || "Pasted input document",
+        content_markdown: content.trim(),
+        kind: "uploaded",
+      }),
+    });
   }
 
   function mergeDetailPreservingOptimistic(
@@ -2925,7 +3225,7 @@ export default function App() {
         );
       }
       if (message.role === "assistant" && !message.content.trim()) {
-        if (job?.isMultiAgent) {
+        if (job?.isMultiAgent || job?.isAgentic) {
           return false;
         }
         const lastServer = serverDetail.messages[serverDetail.messages.length - 1];
@@ -3086,7 +3386,12 @@ export default function App() {
     setConversations((current) =>
       current.map((item) =>
         item.id === conversationId
-          ? { ...item, participant_count: data.participants.length, updated_at: data.conversation.updated_at }
+          ? {
+              ...item,
+              participant_count: data.participants.length,
+              updated_at: data.conversation.updated_at,
+              mode: data.conversation.mode,
+            }
           : item,
       ),
     );
@@ -3101,6 +3406,14 @@ export default function App() {
         ? messageSpeakerLabel(lastAssistant, data.participants, config?.models ?? [])
         : job.currentParticipantName;
       updateGenerationJob(conversationId, { completedSteps, currentParticipantName });
+    }
+    if (job?.isAgentic && job.initialMessageCount != null) {
+      const newSteps = data.messages.slice(job.initialMessageCount + 1).filter((message) => message.message_kind);
+      const lastStep = newSteps[newSteps.length - 1];
+      updateGenerationJob(conversationId, {
+        completedSteps: newSteps.length,
+        currentStepLabel: lastStep ? directorStepLabel(lastStep.message_kind) : job.currentStepLabel,
+      });
     }
     maybeSpeakPendingAssistantReplies(conversationId, data.messages, data.participants);
     return data;
@@ -3136,9 +3449,38 @@ export default function App() {
     setProgressModalConversationId((current) => (current === conversationId ? null : current));
   }
 
+  async function requestAgenticControl(conversationId: number, action: "stop" | "wrap") {
+    setError("");
+    try {
+      const conversation = await request<Conversation>(`/api/conversations/${conversationId}/agentic-control`, {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      });
+      setConversations((current) =>
+        current.map((item) => (item.id === conversationId ? { ...item, ...conversation } : item)),
+      );
+      setDetail((current) =>
+        current && current.conversation.id === conversationId
+          ? { ...current, conversation: { ...current.conversation, ...conversation } }
+          : current,
+      );
+      updateGenerationJob(conversationId, {
+        currentStepLabel: action === "wrap" ? "Director wrapping up" : "Interrupt requested",
+      });
+      setNotice(action === "wrap" ? "Director will wrap up after the current step." : "Director will stop after the current step.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not control agentic process");
+    }
+  }
+
   function cancelGeneration(conversationId?: number) {
     const targetId = conversationId ?? progressModalConversationId ?? activeId;
     if (targetId == null) return;
+    const job = generationJobsRef.current[targetId];
+    if (job?.isAgentic) {
+      void requestAgenticControl(targetId, "stop");
+      return;
+    }
     generationAbortByConversationRef.current.get(targetId)?.abort();
   }
 
@@ -3345,6 +3687,40 @@ export default function App() {
     setIsCreatingAgentProfile(false);
     setEditingAgentProfile(null);
     setAgentProfileEditDraft(null);
+    setGeneratingAgentPersonality(false);
+  }
+
+  async function generateAgentPersonalityDraft() {
+    const draft = agentProfileEditDraft;
+    if (!draft?.name.trim()) {
+      setError("Agent name is required before drafting a personality");
+      return;
+    }
+
+    setGeneratingAgentPersonality(true);
+    setError("");
+    try {
+      const result = await request<{ personality: string }>("/api/agent-profiles/draft-personality", {
+        method: "POST",
+        body: JSON.stringify({
+          name: draft.name.trim(),
+          seed_personality: draft.personality,
+        }),
+      });
+      setAgentProfileEditDraft((current) =>
+        current
+          ? {
+              ...current,
+              personality: result.personality,
+            }
+          : current,
+      );
+      setNotice("Drafted personality with the default LLM.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not draft agent personality");
+    } finally {
+      setGeneratingAgentPersonality(false);
+    }
   }
 
   function syncParticipantsFromSavedAgentProfile(saved: AgentProfile, previousProfile?: AgentProfile | null) {
@@ -3508,38 +3884,137 @@ export default function App() {
     setPromptConfig(data);
     setDefaultPromptDraft(data.default_prompt);
     setDefaultMultiAgentPromptDraft(data.multi_agent_prompt);
+    setDirectorPromptDraft(data.director_prompt);
   }
 
   async function createConversation(event?: FormEvent) {
     event?.preventDefault();
     setError("");
-    const payload: { title?: string; participants?: ConversationParticipantPayload[] } = {
+    const payload: {
+      title?: string;
+      mode?: "single" | "discussion" | "agentic";
+      participants?: ConversationParticipantPayload[];
+      agentic_goal?: string;
+      agentic_success_criteria?: string;
+      agentic_scrape_url?: string;
+      agentic_scrape_depth?: number;
+      agentic_report_format?: string;
+      agentic_max_iterations?: number;
+    } = {
       title: newTitle || undefined,
+      mode: newConversationMode === "single" ? "single" : newConversationMode,
     };
-    if (newConversationMode === "multi") {
+    if (newConversationMode === "discussion") {
       if (newConversationParticipants.length < 1 || newConversationParticipants.length > 3) {
         setError("Select 1 to 3 discussion participants");
         return;
       }
       payload.participants = newConversationParticipants.map(participantPayloadFromDraft);
+    } else if (newConversationMode === "agentic") {
+      if (!newAgenticGoal.trim() || !newAgenticSuccessCriteria.trim()) {
+        setError("Agentic conversations require a goal and success criteria");
+        return;
+      }
+      if (newConversationParticipants.length < 1) {
+        setError("Attach at least one agent");
+        return;
+      }
+      payload.participants = newConversationParticipants.map(participantPayloadFromDraft);
+      payload.agentic_goal = newAgenticGoal.trim();
+      payload.agentic_success_criteria = newAgenticSuccessCriteria.trim();
+      payload.agentic_scrape_url = newAgenticScrapeUrl.trim() || undefined;
+      payload.agentic_scrape_depth = newAgenticScrapeDepth;
+      payload.agentic_report_format = newAgenticReportFormat.trim() || undefined;
+      payload.agentic_max_iterations = newAgenticMaxIterations;
     } else if (newConversationSingleCharacterId != null) {
       const profile = agentProfiles.find((item) => item.id === newConversationSingleCharacterId);
       if (profile) {
         payload.participants = [participantPayloadFromDraft(participantDraftFromProfile(profile))];
       }
     }
+    const pastedInputDocumentTitle = newAgenticInputDocumentTitle.trim();
+    const pastedInputDocumentContent = newAgenticInputDocumentContent.trim();
     const conversation = await request<Conversation>("/api/conversations", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    if (newConversationMode === "agentic" && pastedInputDocumentContent) {
+      await createPastedInputDocument(conversation.id, pastedInputDocumentTitle, pastedInputDocumentContent);
+    }
     setNewTitle("");
     setNewConversationMode("single");
     setNewConversationSingleCharacterId(null);
     setNewConversationParticipants([]);
+    setNewAgenticGoal("");
+    setNewAgenticSuccessCriteria("");
+    setNewAgenticScrapeUrl("");
+    setNewAgenticScrapeDepth(1);
+    setNewAgenticReportFormat("");
+    setNewAgenticMaxIterations(20);
+    setNewAgenticInputDocumentTitle("");
+    setNewAgenticInputDocumentContent("");
     setIsNewConversationModalOpen(false);
     setConversations((current) => [conversation, ...current]);
     setActiveId(conversation.id);
     setPage("chat");
+    if (newConversationMode === "agentic") {
+      void startAgenticRun(conversation);
+    }
+  }
+
+  async function startAgenticRun(conversation: Conversation) {
+    const conversationId = conversation.id;
+    const abortController = new AbortController();
+    generationAbortByConversationRef.current.set(conversationId, abortController);
+    dismissedProgressModalOnPlaybackRef.current.delete(conversationId);
+    setGenerationJobs((current) => ({
+      ...current,
+      [conversationId]: {
+        conversationId,
+        conversationTitle: conversation.title,
+        modelName: "Director orchestrating",
+        contextPreview: null,
+        startedAt: Date.now(),
+        isAgentic: true,
+        completedSteps: 0,
+        currentStepLabel: "Director starting",
+        initialMessageCount: 0,
+      },
+    }));
+    setProgressModalConversationId(conversationId);
+    setGenerationClock(Date.now());
+    setError("");
+    setNotice("");
+
+    try {
+      await request(`/api/conversations/${conversationId}/messages`, {
+        method: "POST",
+        body: JSON.stringify({
+          content: "",
+          agentic_start: true,
+          include_history: historyLimitToIncludeHistory(
+            composerHistoryContextTotal,
+            historyContextOverhead,
+            historyDbMessageCount,
+          ),
+          include_memories: includeMemories,
+          include_all_memories: includeAllMemories,
+          answer_length: answerLength,
+        }),
+        signal: abortController.signal,
+      });
+      await loadConversation(conversationId);
+      removeGenerationJob(conversationId);
+      await loadConversations();
+    } catch (err) {
+      removeGenerationJob(conversationId);
+      if (isAbortError(err)) {
+        setNotice("Director start cancelled.");
+      } else {
+        setError(err instanceof Error ? err.message : "Could not start director");
+      }
+      await loadConversation(conversationId);
+    }
   }
 
   function openNewConversationModal() {
@@ -3548,6 +4023,14 @@ export default function App() {
     setNewConversationMode("single");
     setNewConversationSingleCharacterId(null);
     setNewConversationParticipants([]);
+    setNewAgenticGoal("");
+    setNewAgenticSuccessCriteria("");
+    setNewAgenticScrapeUrl("");
+    setNewAgenticScrapeDepth(1);
+    setNewAgenticReportFormat("");
+    setNewAgenticMaxIterations(20);
+    setNewAgenticInputDocumentTitle("");
+    setNewAgenticInputDocumentContent("");
     setParticipantEditorTarget("new");
     setIsNewConversationModalOpen(true);
   }
@@ -3568,10 +4051,34 @@ export default function App() {
     setIsParticipantsModalOpen(true);
   }
 
+  function openAgenticSetupModal() {
+    if (!detail || detail.conversation.mode !== "agentic") return;
+    setError("");
+    setParticipantEditorTarget("edit");
+    setNewAgenticGoal(detail.conversation.agentic_goal ?? "");
+    setNewAgenticSuccessCriteria(detail.conversation.agentic_success_criteria ?? "");
+    setNewAgenticScrapeUrl(detail.conversation.agentic_scrape_url ?? "");
+    setNewAgenticScrapeDepth(detail.conversation.agentic_scrape_depth ?? 1);
+    setNewAgenticReportFormat(detail.conversation.agentic_report_format ?? "");
+    setNewAgenticMaxIterations(detail.conversation.agentic_max_iterations ?? 20);
+    setParticipantsDraft(
+      detail.participants.map((participant) => ({
+        llm_model_id: participant.llm_model_id,
+        personality: participant.personality,
+        name: participant.name,
+        tts_voice_uri: participant.tts_voice_uri ?? "",
+        tts_speech_rate: participant.tts_speech_rate ?? null,
+        agent_profile_id: participant.agent_profile_id ?? null,
+      })),
+    );
+    setIsAgenticSetupModalOpen(true);
+  }
+
   async function saveParticipants(event?: FormEvent) {
     event?.preventDefault();
-    if (!activeId || participantsDraft.length < 1 || participantsDraft.length > 3) {
-      setError("Select 1 to 3 discussion participants");
+    const maxParticipants = isAgenticConversation ? null : 3;
+    if (!activeId || participantsDraft.length < 1 || (maxParticipants != null && participantsDraft.length > maxParticipants)) {
+      setError(maxParticipants != null ? "Select 1 to 3 discussion participants" : "Attach at least one agent");
       return;
     }
     setSavingParticipants(true);
@@ -3581,7 +4088,10 @@ export default function App() {
         `/api/conversations/${activeId}/participants`,
         {
           method: "PUT",
-          body: JSON.stringify({ participants: participantsDraft.map(participantPayloadFromDraft) }),
+          body: JSON.stringify({
+            participants: participantsDraft.map(participantPayloadFromDraft),
+            mode: conversationMode,
+          }),
         },
       );
       setDetail((current) => (current ? { ...current, participants } : current));
@@ -3596,6 +4106,46 @@ export default function App() {
       setError(err instanceof Error ? err.message : "Could not update participants");
     } finally {
       setSavingParticipants(false);
+    }
+  }
+
+  async function saveAgenticSetup(event?: FormEvent) {
+    event?.preventDefault();
+    if (!activeId) return;
+    if (!newAgenticGoal.trim() || !newAgenticSuccessCriteria.trim()) {
+      setError("Agentic conversations require a goal and success criteria");
+      return;
+    }
+    if (participantsDraft.length < 1) {
+      setError("Attach at least one agent");
+      return;
+    }
+
+    setSavingAgenticSetup(true);
+    setError("");
+    try {
+      const updated = await request<ConversationDetail>(`/api/conversations/${activeId}/agentic-setup`, {
+        method: "PUT",
+        body: JSON.stringify({
+          participants: participantsDraft.map(participantPayloadFromDraft),
+          agentic_goal: newAgenticGoal.trim(),
+          agentic_success_criteria: newAgenticSuccessCriteria.trim(),
+          agentic_scrape_url: newAgenticScrapeUrl.trim() || null,
+          agentic_scrape_depth: newAgenticScrapeDepth,
+          agentic_report_format: newAgenticReportFormat.trim() || null,
+          agentic_max_iterations: newAgenticMaxIterations,
+        }),
+      });
+      setDetail(updated);
+      setConversations((current) =>
+        current.map((item) => (item.id === updated.conversation.id ? updated.conversation : item)),
+      );
+      setIsAgenticSetupModalOpen(false);
+      setNotice("Agentic setup updated.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update agentic setup");
+    } finally {
+      setSavingAgenticSetup(false);
     }
   }
 
@@ -3923,7 +4473,41 @@ export default function App() {
     const image = options?.image === undefined ? pendingImage : options.image;
     const content = (overrideContent ?? input).trim();
     const conversationId = activeId;
-    if (!conversationId || conversationId in generationJobs || (!content && !image)) return;
+    if (!conversationId || (!content && !image)) return;
+
+    if (conversationId in generationJobs) {
+      const job = generationJobs[conversationId];
+      if (job?.isAgentic && content && !image) {
+        if (!options?.userMessageAlreadyShown) {
+          appendOptimisticUserMessage(content);
+        }
+        setInput("");
+        setError("");
+        try {
+          await request(`/api/conversations/${conversationId}/messages`, {
+            method: "POST",
+            body: JSON.stringify({
+              content,
+              agentic_ad_hoc: true,
+              include_history: historyLimitToIncludeHistory(
+                composerHistoryContextTotal,
+                historyContextOverhead,
+                historyDbMessageCount,
+              ),
+              include_memories: includeMemories,
+              include_all_memories: includeAllMemories,
+              answer_length: answerLength,
+            }),
+          });
+          await loadConversation(conversationId);
+          updateGenerationJob(conversationId, { currentStepLabel: "User clarification received" });
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Could not send clarification");
+          await loadConversation(conversationId);
+        }
+      }
+      return;
+    }
 
     if (!image && content.toLowerCase() === "map memories") {
       if (!options?.userMessageAlreadyShown) {
@@ -3937,13 +4521,17 @@ export default function App() {
       detail?.conversation.title ??
       conversations.find((conversation) => conversation.id === conversationId)?.title ??
       "Conversation";
-    const modelName = isMultiAgentConversation
+    const modelName = isAgenticConversation
+      ? "Director orchestrating"
+      : isMultiAgentConversation
       ? multiAgentOverrideModel
         ? `${activeParticipants.length} agents → ${multiAgentOverrideModel.model}`
         : `${activeParticipants.length} agents`
       : activeModelName;
     const totalSteps = isMultiAgentConversation
       ? activeParticipants.length * Math.max(1, Math.min(10, discussionRounds))
+      : isAgenticConversation
+      ? undefined
       : 1;
     const roundsForThisSend = isMultiAgentConversation
       ? Math.max(1, Math.min(10, discussionRounds))
@@ -3963,11 +4551,13 @@ export default function App() {
         contextPreview: null,
         startedAt: Date.now(),
         isMultiAgent: isMultiAgentConversation,
+        isAgentic: isAgenticConversation,
         totalSteps,
         completedSteps: 0,
         currentParticipantName: isMultiAgentConversation
           ? participantDisplayName(activeParticipants[0], config?.models ?? [])
           : undefined,
+        currentStepLabel: isAgenticConversation ? "Director planning" : undefined,
         initialMessageCount,
         speakReplies: options?.speakReply ?? false,
         autoPlayReplies: isMultiAgentConversation,
@@ -3981,7 +4571,7 @@ export default function App() {
     setGenerationClock(Date.now());
 
     if (content || image) {
-      if (isMultiAgentConversation) {
+      if (isMultiAgentConversation || isAgenticConversation) {
         if (!options?.userMessageAlreadyShown) {
           appendOptimisticUserMessage(content || "Image message");
         }
@@ -3996,7 +4586,7 @@ export default function App() {
     setError("");
     setNotice("");
 
-    if (isMultiAgentConversation || options?.speakReply) {
+    if (isMultiAgentConversation || isAgenticConversation || options?.speakReply) {
       beginAssistantReplyPlayback(conversationId, initialMessageCount);
     }
     if (options?.speakReply) {
@@ -4515,6 +5105,12 @@ export default function App() {
     );
   }
 
+  function openConversationDocuments(conversationId: number) {
+    setDocumentSearch("");
+    setActiveId(conversationId);
+    setPage("documents");
+  }
+
   function openConversationMemories(conversationId: number) {
     setMemorySearch("");
     setExpandedMemoryGroupIds((current) =>
@@ -4696,6 +5292,10 @@ export default function App() {
             <Brain size={18} />
             Memories
           </button>
+          <button className={page === "documents" ? "nav-active" : ""} onClick={() => setPage("documents")}>
+            <FileText size={18} />
+            Documents
+          </button>
           <button className={page === "settings" ? "nav-active" : ""} onClick={() => setPage("settings")}>
             <Settings size={18} />
             Config
@@ -4763,6 +5363,20 @@ export default function App() {
                         <button
                           type="button"
                           className="conversation-header-memories"
+                          title="Open documents for this conversation"
+                          aria-label="Open documents for this conversation"
+                          onClick={() => openConversationDocuments(activeConversation.id)}
+                        >
+                          <FileText size={16} />
+                          {(detail?.documents?.length ?? 0) > 0 && (
+                            <span className="conversation-header-memories-count">{detail?.documents?.length}</span>
+                          )}
+                        </button>
+                      )}
+                      {activeConversation && editingConversationId !== activeConversation.id && (
+                        <button
+                          type="button"
+                          className="conversation-header-memories"
                           title={
                             (detail?.memories.length ?? 0) > 0
                               ? `Open memories for this discussion (${detail?.memories.length ?? 0})`
@@ -4781,18 +5395,18 @@ export default function App() {
                   )}
                   {activeConversation && editingConversationId !== activeConversation.id && (
                     <>
-                      {isMultiAgentConversation && (
+                      {isMultiAgentConversation || isAgenticConversation ? (
                         <button
                           type="button"
                           className="conversation-header-participants"
-                          title="Edit discussion participants"
-                          onClick={openParticipantsModal}
+                          title={isAgenticConversation ? "Edit agentic setup" : "Edit discussion participants"}
+                          onClick={isAgenticConversation ? openAgenticSetupModal : openParticipantsModal}
                           disabled={activeConversationGenerating}
                         >
                           <Sparkles size={16} />
-                          Participants
+                          {isAgenticConversation ? "Agentic" : "Participants"}
                         </button>
-                      )}
+                      ) : null}
                       <button
                         type="button"
                         className="conversation-header-delete"
@@ -4831,14 +5445,25 @@ export default function App() {
                   message.participant_id != null
                     ? activeParticipants.find((item) => item.id === message.participant_id)
                     : undefined;
+                const isDirectorStep = isDirectorStepMessage(message);
+                const documentId =
+                  message.message_kind === "director_document"
+                    ? Number((message.metadata as { document_id?: number } | null)?.document_id)
+                    : null;
+                const processDocumentId =
+                  message.message_kind === "director_document"
+                    ? Number((message.metadata as { process_document_id?: number } | null)?.process_document_id)
+                    : null;
                 return (
                   <article
                     id={`message-${message.id}`}
                     key={message.id}
-                    className={`message ${message.role}${isSpeaking ? " message-being-read" : ""}`}
+                    className={`message ${message.role}${isSpeaking ? " message-being-read" : ""}${isDirectorStep ? " message-director-step" : ""}`}
                   >
                     <div className="message-meta">
-                      <strong title={participant?.personality?.trim() || undefined}>{speakerLabel}</strong>
+                      <strong title={participant?.personality?.trim() || undefined}>
+                        {isDirectorStep ? directorStepLabel(message.message_kind) : speakerLabel}
+                      </strong>
                       <span>{formatDate(message.created_at)}</span>
                       {message.role === "assistant" &&
                         (message.llm_model ||
@@ -4941,6 +5566,56 @@ export default function App() {
                               {message.content}
                             </ReactMarkdown>
                           )}
+                          {message.message_kind === "director_evaluation" &&
+                            typeof (message.metadata as { success_score?: number } | null)?.success_score === "number" && (
+                              <p className="director-evaluation-meta">
+                                Success score: {(message.metadata as { success_score: number }).success_score}%
+                              </p>
+                            )}
+                          {documentId && detail?.documents?.length ? (
+                            <div className="director-document-actions">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const doc = detail.documents?.find((item) => item.id === documentId);
+                                  if (doc) setSelectedDocument(doc);
+                                }}
+                              >
+                                Open output
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const doc = detail.documents?.find((item) => item.id === documentId);
+                                  if (doc) openDocumentPdf(doc);
+                                }}
+                              >
+                                Download output PDF
+                              </button>
+                              {processDocumentId ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const doc = detail.documents?.find((item) => item.id === processDocumentId);
+                                      if (doc) setSelectedDocument(doc);
+                                    }}
+                                  >
+                                    Open process
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const doc = detail.documents?.find((item) => item.id === processDocumentId);
+                                      if (doc) openDocumentPdf(doc);
+                                    }}
+                                  >
+                                    Download process PDF
+                                  </button>
+                                </>
+                              ) : null}
+                            </div>
+                          ) : null}
                         </>
                       )}
                     </div>
@@ -5031,7 +5706,7 @@ export default function App() {
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
                 onPaste={handleComposerPaste}
-                disabled={!activeId || activeConversationGenerating || isTranscribing}
+                disabled={!activeId || (activeConversationGenerating && !canSendAgenticAdHoc) || isTranscribing}
               />
               <div className="composer-actions">
                 <div className="composer-send-cluster">
@@ -5063,12 +5738,45 @@ export default function App() {
                     >
                       <ImagePlus size={18} />
                     </button>
+                    <input
+                      ref={composerDocumentUploadRef}
+                      type="file"
+                      accept=".md,.txt,.pdf,text/markdown,text/plain,application/pdf"
+                      hidden
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = "";
+                        if (file && activeId) void uploadDocument(file, activeId);
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="composer-mic"
+                      title="Upload a document"
+                      onClick={() => composerDocumentUploadRef.current?.click()}
+                      disabled={!activeId || activeConversationGenerating || isTranscribing || isRecording || documentUploadBusy}
+                    >
+                      {documentUploadBusy ? <Loader2 size={18} className="spin" /> : <FileText size={18} />}
+                    </button>
                     <button
                       type="submit"
                       className="composer-send"
-                      disabled={!activeId || activeConversationGenerating || isTranscribing || (!isRecording && !input.trim() && !pendingImage)}
+                      disabled={
+                        !activeId ||
+                        isTranscribing ||
+                        (activeConversationGenerating && !canSendAgenticAdHoc) ||
+                        (!isRecording && !input.trim() && !pendingImage)
+                      }
                     >
-                      {isTranscribing ? "Transcribing..." : activeConversationGenerating ? "Thinking..." : isRecording ? "Stop & send" : "Send"}
+                      {isTranscribing
+                        ? "Transcribing..."
+                        : activeConversationGenerating && canSendAgenticAdHoc
+                          ? "Send clarification"
+                          : activeConversationGenerating
+                            ? "Thinking..."
+                            : isRecording
+                              ? "Stop & send"
+                              : "Send"}
                     </button>
                   </div>
                   <div className="composer-model-controls">
@@ -5503,6 +6211,103 @@ export default function App() {
             </div>
           </section>
         )}
+
+        {page === "documents" && (
+          <section className="memory-page documents-page">
+            <header className="page-header">
+              <div>
+                <p className="eyebrow">Documents</p>
+                <h1>{detail?.conversation.title ?? "Select a conversation"}</h1>
+              </div>
+              <div className="memory-toolbar">
+                <input
+                  value={documentSearch}
+                  onChange={(event) => setDocumentSearch(event.target.value)}
+                  placeholder="Search documents..."
+                />
+                <input
+                  ref={documentUploadInputRef}
+                  type="file"
+                  accept=".md,.txt,.pdf,text/markdown,text/plain,application/pdf"
+                  hidden
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file && activeId) void uploadDocument(file, activeId);
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={!activeId || documentUploadBusy}
+                  onClick={() => documentUploadInputRef.current?.click()}
+                >
+                  {documentUploadBusy ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
+                  Upload document
+                </button>
+              </div>
+            </header>
+            <form className="document-website-upload" onSubmit={uploadWebsiteDocument}>
+              <label className="document-website-url-field">
+                Website URL
+                <input
+                  type="url"
+                  value={documentWebsiteUrl}
+                  onChange={(event) => setDocumentWebsiteUrl(event.target.value)}
+                  placeholder="https://example.com"
+                  disabled={!activeId || documentWebsiteUploadBusy}
+                />
+              </label>
+              <label>
+                Document title
+                <input
+                  value={documentWebsiteTitle}
+                  onChange={(event) => setDocumentWebsiteTitle(event.target.value)}
+                  placeholder="Use site title"
+                  disabled={!activeId || documentWebsiteUploadBusy}
+                />
+              </label>
+              <label className="document-website-depth-field">
+                Crawl depth
+                <input
+                  type="range"
+                  min={1}
+                  max={3}
+                  step={1}
+                  value={documentWebsiteDepth}
+                  onChange={(event) => setDocumentWebsiteDepth(Number(event.target.value))}
+                  disabled={!activeId || documentWebsiteUploadBusy}
+                />
+                <span>{documentWebsiteDepth}</span>
+              </label>
+              <button
+                type="submit"
+                disabled={!activeId || documentWebsiteUploadBusy || !documentWebsiteUrl.trim()}
+              >
+                {documentWebsiteUploadBusy ? <Loader2 size={16} className="spin" /> : <Network size={16} />}
+                {documentWebsiteUploadBusy ? "Importing website..." : "Import website"}
+              </button>
+            </form>
+            <div className="documents-list">
+              {!activeId && <div className="empty-card">Select a conversation to view its documents.</div>}
+              {activeId && !visibleDocuments.length && (
+                <div className="empty-card">No documents yet. Upload Markdown, text, or PDF, or generate one in agentic mode.</div>
+              )}
+              {visibleDocuments.map((document) => (
+                <article className="document-row" key={document.id}>
+                  <button type="button" className="document-row-main" onClick={() => setSelectedDocument(document)}>
+                    <strong>{document.title}</strong>
+                    <small>
+                      {documentKindLabel(document.kind)} · {formatDate(document.updated_at)}
+                    </small>
+                  </button>
+                  <button type="button" title="Download PDF" onClick={() => openDocumentPdf(document)}>
+                    <FileDown size={16} />
+                  </button>
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
         {page === "stats" && (
           <section className="stats-page">
             <header className="page-header stats-page-header">
@@ -5567,7 +6372,7 @@ export default function App() {
                       <BarChart2 size={18} />
                       <div>
                         <h2>Activity over time</h2>
-                        <p>Daily message volume</p>
+                        <p>Daily requests by model</p>
                       </div>
                     </div>
                     <UsageDailyChart daily={usageStats.daily} />
@@ -5942,14 +6747,14 @@ export default function App() {
               </section>
 
               <section className="prompt-settings-section" aria-labelledby="multi-agent-prompt-heading">
-                <h3 id="multi-agent-prompt-heading">Multi-agent discussions</h3>
+                <h3 id="multi-agent-prompt-heading">Discussions</h3>
                 <p>
-                  Used instead of the single-agent prompt when a conversation has discussion participants. The placeholder{" "}
+                  Used instead of the single-agent prompt when a conversation is in discussion mode. The placeholder{" "}
                   <code>{`{character_name}`}</code> is replaced with each agent&apos;s name; who else is in the discussion is
                   already visible in the labeled transcript below.
                 </p>
                 <label>
-                  Multi-agent system prompt
+                  Discussion system prompt
                   <textarea
                     className="prompt-settings-textarea prompt-settings-textarea-multi"
                     value={defaultMultiAgentPromptDraft}
@@ -5966,6 +6771,35 @@ export default function App() {
                       !promptConfig ||
                       defaultMultiAgentPromptDraft === promptConfig.multi_agent_prompt_baseline
                     }
+                  >
+                    <RotateCcw size={16} />
+                    Reset to default
+                  </button>
+                </div>
+              </section>
+
+              <section className="prompt-settings-section" aria-labelledby="director-prompt-heading">
+                <h3 id="director-prompt-heading">Agentic director</h3>
+                <p>
+                  Used when a conversation runs in agentic mode. Placeholders:{" "}
+                  <code>{`{goal}`}</code>, <code>{`{success_criteria}`}</code>, <code>{`{agent_list}`}</code>,{" "}
+                  <code>{`{document_list}`}</code>, <code>{`{scrape_url}`}</code>, <code>{`{report_format}`}</code>.
+                </p>
+                <label>
+                  Director system prompt
+                  <textarea
+                    className="prompt-settings-textarea prompt-settings-textarea-multi"
+                    value={directorPromptDraft}
+                    onChange={(event) => setDirectorPromptDraft(event.target.value)}
+                    rows={22}
+                  />
+                </label>
+                <div className="prompt-settings-actions">
+                  <button
+                    type="button"
+                    className="prompt-reset-button"
+                    onClick={resetDirectorPrompt}
+                    disabled={!promptConfig || directorPromptDraft === promptConfig.director_prompt_baseline}
                   >
                     <RotateCcw size={16} />
                     Reset to default
@@ -6302,9 +7136,12 @@ export default function App() {
                     {conversation.title}
                   </strong>
                   <span className="conversation-select-meta">
-                    {(conversation.participant_count ?? 0) > 1 && (
-                      <span className="conversation-multi-badge" title="Multi-agent discussion">
-                        Multi
+                    {(conversation.mode === "agentic" || (conversation.participant_count ?? 0) > 1) && (
+                      <span
+                        className={`conversation-multi-badge${conversation.mode === "agentic" ? " conversation-agentic-badge" : ""}`}
+                        title={conversation.mode === "agentic" ? "Agentic" : "Discussion"}
+                      >
+                        {conversation.mode === "agentic" ? "Agentic" : "Discussion"}
                       </span>
                     )}
                     {generationJobs[conversation.id] ? (
@@ -6411,7 +7248,13 @@ export default function App() {
 
       {isNewConversationModalOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setIsNewConversationModalOpen(false)}>
-          <form className="modal-card new-conversation-modal participants-modal" onSubmit={createConversation} onMouseDown={(event) => event.stopPropagation()}>
+          <form
+            className={`modal-card new-conversation-modal participants-modal${
+              newConversationMode === "agentic" ? " agentic-setup-modal" : ""
+            }`}
+            onSubmit={createConversation}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
             <div>
               <p className="eyebrow">New conversation</p>
               <h2>Name this conversation</h2>
@@ -6439,16 +7282,31 @@ export default function App() {
                 <input
                   type="radio"
                   name="conversation-mode"
-                  checked={newConversationMode === "multi"}
+                  checked={newConversationMode === "discussion"}
                   onChange={() => {
-                    setNewConversationMode("multi");
+                    setNewConversationMode("discussion");
                     setNewConversationSingleCharacterId(null);
                     if (!newConversationParticipants.length && config?.models.length) {
                       setNewConversationParticipants([createParticipantDraft(config.models)]);
                     }
                   }}
                 />
-                Multi-agent discussion
+                Discussion
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="conversation-mode"
+                  checked={newConversationMode === "agentic"}
+                  onChange={() => {
+                    setNewConversationMode("agentic");
+                    setNewConversationSingleCharacterId(null);
+                    if (!newConversationParticipants.length && config?.models.length) {
+                      setNewConversationParticipants([createParticipantDraft(config.models)]);
+                    }
+                  }}
+                />
+                Agentic
               </label>
             </div>
             {newConversationMode === "single" ? (
@@ -6473,7 +7331,7 @@ export default function App() {
                 ) : null}
               </label>
             ) : null}
-            {newConversationMode === "multi" && config?.models.length ? (
+            {newConversationMode === "discussion" && config?.models.length ? (
               <ParticipantEditor
                 participants={newConversationParticipants}
                 onChange={setNewConversationParticipants}
@@ -6484,7 +7342,108 @@ export default function App() {
                 onUpdateProfile={updateAgentProfileFromDraft}
                 onPlayVoiceSample={playModelVoiceSample}
                 savingProfileIndex={participantEditorTarget === "new" ? savingAgentProfileIndex : null}
+                maxParticipants={3}
               />
+            ) : null}
+            {newConversationMode === "agentic" && config?.models.length ? (
+              <>
+                <div className="agentic-setup-grid">
+                  <label>
+                    Goal
+                    <textarea
+                      value={newAgenticGoal}
+                      onChange={(event) => setNewAgenticGoal(event.target.value)}
+                      placeholder="What should the director accomplish?"
+                      rows={4}
+                    />
+                  </label>
+                  <label>
+                    Success criteria
+                    <textarea
+                      value={newAgenticSuccessCriteria}
+                      onChange={(event) => setNewAgenticSuccessCriteria(event.target.value)}
+                      placeholder="How will you know the task is complete?"
+                      rows={4}
+                    />
+                  </label>
+                  <label className="agentic-scrape-url-field">
+                    Website URL (optional)
+                    <input
+                      value={newAgenticScrapeUrl}
+                      onChange={(event) => setNewAgenticScrapeUrl(event.target.value)}
+                      placeholder="https://example.com"
+                    />
+                  </label>
+                  <label className="agentic-scrape-depth-field">
+                    Scrape depth: {newAgenticScrapeDepth}
+                    <input
+                      type="range"
+                      min={1}
+                      max={3}
+                      step={1}
+                      value={newAgenticScrapeDepth}
+                      onChange={(event) => setNewAgenticScrapeDepth(Number(event.target.value))}
+                    />
+                    <span className="agentic-scrape-depth-help">
+                      {newAgenticScrapeDepth === 1
+                        ? "Only this page"
+                        : newAgenticScrapeDepth === 2
+                          ? "This page and linked pages"
+                          : "Pages and sub-pages to level 3"}
+                    </span>
+                  </label>
+                  <label>
+                    Report format (optional)
+                    <input
+                      value={newAgenticReportFormat}
+                      onChange={(event) => setNewAgenticReportFormat(event.target.value)}
+                      placeholder="RCA, executive brief, implementation plan..."
+                    />
+                  </label>
+                  <label className="agentic-field-compact">
+                    Iteration budget
+                    <input
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={newAgenticMaxIterations}
+                      onChange={(event) => setNewAgenticMaxIterations(Number(event.target.value) || 20)}
+                    />
+                  </label>
+                  <label>
+                    Input document title (optional)
+                    <input
+                      value={newAgenticInputDocumentTitle}
+                      onChange={(event) => setNewAgenticInputDocumentTitle(event.target.value)}
+                      placeholder="Pasted input document"
+                    />
+                  </label>
+                  <label className="agentic-input-document-field">
+                    Paste input document (optional)
+                    <textarea
+                      value={newAgenticInputDocumentContent}
+                      onChange={(event) => setNewAgenticInputDocumentContent(event.target.value)}
+                      placeholder="Paste Markdown, notes, source material, requirements, or other context for the Director..."
+                      rows={8}
+                    />
+                    <span className="agentic-scrape-depth-help">
+                      Saved as a conversation document before the Director starts.
+                    </span>
+                  </label>
+                </div>
+                <ParticipantEditor
+                  participants={newConversationParticipants}
+                  onChange={setNewConversationParticipants}
+                  models={config.models}
+                  agentProfiles={agentProfiles}
+                  ttsVoiceOptions={ttsVoiceOptions}
+                  onSaveProfile={saveAgentProfileFromDraft}
+                  onUpdateProfile={updateAgentProfileFromDraft}
+                  onPlayVoiceSample={playModelVoiceSample}
+                  savingProfileIndex={participantEditorTarget === "new" ? savingAgentProfileIndex : null}
+                  maxParticipants={null}
+                />
+              </>
             ) : null}
             <div className="modal-actions">
               <button type="button" className="secondary-button" onClick={() => setIsNewConversationModalOpen(false)}>
@@ -6522,6 +7481,8 @@ export default function App() {
               agentProfiles={agentProfiles}
               ttsVoiceOptions={ttsVoiceOptions}
               onPlayVoiceSample={playModelVoiceSample}
+              onGeneratePersonality={generateAgentPersonalityDraft}
+              generatingPersonality={generatingAgentPersonality}
               expandedPersonality
             />
             <div className="modal-actions">
@@ -6538,6 +7499,119 @@ export default function App() {
                   <>
                     <Save size={16} />
                     {isCreatingAgentProfile ? "Create" : "Save"}
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {isAgenticSetupModalOpen && config?.models.length && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setIsAgenticSetupModalOpen(false)}>
+          <form
+            className="modal-card new-conversation-modal participants-modal agentic-setup-modal"
+            onSubmit={saveAgenticSetup}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div>
+              <p className="eyebrow">Agentic conversation</p>
+              <h2>Edit setup</h2>
+              <p className="modal-copy">
+                Changes apply to the next director run. Existing director steps and agent replies stay unchanged.
+              </p>
+            </div>
+            <div className="agentic-setup-grid">
+              <label>
+                Goal
+                <textarea
+                  autoFocus
+                  value={newAgenticGoal}
+                  onChange={(event) => setNewAgenticGoal(event.target.value)}
+                  placeholder="What should the director accomplish?"
+                  rows={4}
+                />
+              </label>
+              <label>
+                Success criteria
+                <textarea
+                  value={newAgenticSuccessCriteria}
+                  onChange={(event) => setNewAgenticSuccessCriteria(event.target.value)}
+                  placeholder="How will you know the task is complete?"
+                  rows={4}
+                />
+              </label>
+              <label className="agentic-scrape-url-field">
+                Website URL (optional)
+                <input
+                  value={newAgenticScrapeUrl}
+                  onChange={(event) => setNewAgenticScrapeUrl(event.target.value)}
+                  placeholder="https://example.com"
+                />
+              </label>
+              <label className="agentic-scrape-depth-field">
+                Scrape depth: {newAgenticScrapeDepth}
+                <input
+                  type="range"
+                  min={1}
+                  max={3}
+                  step={1}
+                  value={newAgenticScrapeDepth}
+                  onChange={(event) => setNewAgenticScrapeDepth(Number(event.target.value))}
+                />
+                <span className="agentic-scrape-depth-help">
+                  {newAgenticScrapeDepth === 1
+                    ? "Only this page"
+                    : newAgenticScrapeDepth === 2
+                      ? "This page and linked pages"
+                      : "Pages and sub-pages to level 3"}
+                </span>
+              </label>
+              <label>
+                Report format (optional)
+                <input
+                  value={newAgenticReportFormat}
+                  onChange={(event) => setNewAgenticReportFormat(event.target.value)}
+                  placeholder="RCA, executive brief, implementation plan..."
+                />
+              </label>
+              <label className="agentic-field-compact">
+                Iteration budget
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={newAgenticMaxIterations}
+                  onChange={(event) => setNewAgenticMaxIterations(Number(event.target.value) || 20)}
+                />
+              </label>
+            </div>
+            <ParticipantEditor
+              participants={participantsDraft}
+              onChange={setParticipantsDraft}
+              models={config.models}
+              agentProfiles={agentProfiles}
+              ttsVoiceOptions={ttsVoiceOptions}
+              onSaveProfile={saveAgentProfileFromDraft}
+              onUpdateProfile={updateAgentProfileFromDraft}
+              onPlayVoiceSample={playModelVoiceSample}
+              savingProfileIndex={participantEditorTarget === "edit" ? savingAgentProfileIndex : null}
+              maxParticipants={null}
+            />
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={() => setIsAgenticSetupModalOpen(false)}>
+                Cancel
+              </button>
+              <button type="submit" disabled={savingAgenticSetup}>
+                {savingAgenticSetup ? (
+                  <>
+                    <Loader2 size={16} className="spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save size={16} />
+                    Save setup
                   </>
                 )}
               </button>
@@ -6880,9 +7954,11 @@ export default function App() {
                 <Brain size={36} />
               </div>
               <div>
-                <p>{progressModalJob.isMultiAgent ? "Multi-agent discussion" : "Generating with"}</p>
+                <p>{progressModalJob.isAgentic ? "Director orchestrating" : progressModalJob.isMultiAgent ? "Discussion" : "Generating with"}</p>
                 <strong>
-                  {progressModalJob.isMultiAgent && progressModalJob.totalSteps
+                  {progressModalJob.isAgentic
+                    ? progressModalJob.currentStepLabel ?? "Planning next action"
+                    : progressModalJob.isMultiAgent && progressModalJob.totalSteps
                     ? progressModalJob.currentParticipantName
                       ? `${progressModalJob.currentParticipantName} · ${Math.min(
                           progressModalJob.completedSteps ?? 0,
@@ -7044,12 +8120,21 @@ export default function App() {
               >
                 Close and continue
               </button>
+              {progressModalJob.isAgentic && (
+                <button
+                  type="button"
+                  className="secondary-button llm-progress-wrap"
+                  onClick={() => void requestAgenticControl(progressModalJob.conversationId, "wrap")}
+                >
+                  Wrap up now
+                </button>
+              )}
               <button
                 type="button"
                 className="secondary-button llm-progress-cancel"
                 onClick={() => cancelGeneration(progressModalJob.conversationId)}
               >
-                Stop now
+                {progressModalJob.isAgentic ? "Interrupt" : "Stop now"}
               </button>
             </div>
           </div>
@@ -7132,6 +8217,36 @@ export default function App() {
             ))}
           </div>
         </section>
+      )}
+
+      {selectedDocument && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setSelectedDocument(null)}>
+          <div className="modal-card document-viewer-modal" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="document-viewer-header">
+              <div>
+                <p className="eyebrow">{documentKindLabel(selectedDocument.kind)}</p>
+                <h2>{selectedDocument.title}</h2>
+              </div>
+              <button type="button" className="modal-close-button" onClick={() => setSelectedDocument(null)} aria-label="Close">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="document-viewer-body message-content">
+              <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} rehypePlugins={MARKDOWN_REHYPE_PLUGINS}>
+                {selectedDocument.content_markdown}
+              </ReactMarkdown>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={() => setSelectedDocument(null)}>
+                Close
+              </button>
+              <button type="button" onClick={() => openDocumentPdf(selectedDocument)}>
+                <FileDown size={16} />
+                Download PDF
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {selectedClip && (

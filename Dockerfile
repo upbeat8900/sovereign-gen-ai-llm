@@ -23,7 +23,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt \
+    && python -m playwright install --with-deps chromium
 
 COPY backend ./backend
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist

@@ -15,8 +15,16 @@ def clamp_discussion_rounds(value: int) -> int:
     return max(1, min(MAX_DISCUSSION_ROUNDS, int(value)))
 
 
-def validate_participant_payloads(participants: list, connection, llm_model_or_404: Callable) -> None:
-    if not participants or len(participants) > 3:
+def validate_participant_payloads(
+    participants: list,
+    connection,
+    llm_model_or_404: Callable,
+    *,
+    mode: str = "discussion",
+) -> None:
+    if not participants:
+        raise HTTPException(status_code=400, detail="Provide at least one participant")
+    if mode == "discussion" and len(participants) > 3:
         raise HTTPException(status_code=400, detail="Provide 1 to 3 discussion participants")
     for participant in participants:
         llm_model_or_404(connection, participant.llm_model_id)
@@ -65,8 +73,15 @@ def public_participant(row: dict) -> dict:
     }
 
 
-def replace_participants(connection, conversation_id: int, participants: list, llm_model_or_404: Callable) -> List[dict]:
-    validate_participant_payloads(participants, connection, llm_model_or_404)
+def replace_participants(
+    connection,
+    conversation_id: int,
+    participants: list,
+    llm_model_or_404: Callable,
+    *,
+    mode: str = "discussion",
+) -> List[dict]:
+    validate_participant_payloads(participants, connection, llm_model_or_404, mode=mode)
     connection.execute(
         "DELETE FROM conversation_participants WHERE conversation_id = ?",
         (conversation_id,),

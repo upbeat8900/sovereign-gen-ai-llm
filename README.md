@@ -63,6 +63,7 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate
 # macOS/Linux: source .venv/bin/activate
 pip install -r backend/requirements.txt
+python -m playwright install chromium
 
 # Optional: point at your Ollama instance
 export OLLAMA_HOST=http://localhost:11434

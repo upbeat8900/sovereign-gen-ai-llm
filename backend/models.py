@@ -80,13 +80,59 @@ class AgentProfileRead(BaseModel):
     updated_at: str
 
 
+class AgentPersonalityDraftCreate(BaseModel):
+    name: str = Field(min_length=1)
+    seed_personality: str = ""
+
+
+class AgentPersonalityDraftRead(BaseModel):
+    personality: str
+
+
 class ConversationParticipantsUpdate(BaseModel):
-    participants: List[ConversationParticipantUpdate] = Field(min_length=1, max_length=3)
+    participants: List[ConversationParticipantUpdate] = Field(min_length=1)
+    mode: Optional[Literal["discussion", "agentic"]] = None
+
+
+class ConversationAgenticSetupUpdate(BaseModel):
+    participants: List[ConversationParticipantUpdate] = Field(min_length=1)
+    agentic_goal: str = Field(min_length=1)
+    agentic_success_criteria: str = Field(min_length=1)
+    agentic_scrape_url: Optional[str] = None
+    agentic_scrape_depth: int = Field(default=1, ge=1, le=3)
+    agentic_report_format: Optional[str] = None
+    agentic_max_iterations: int = Field(default=20, ge=1, le=50)
+
+    @model_validator(mode="after")
+    def validate_agentic_setup(self):
+        if not self.agentic_goal.strip():
+            raise ValueError("Agentic conversations require a goal")
+        if not self.agentic_success_criteria.strip():
+            raise ValueError("Agentic conversations require success criteria")
+        return self
 
 
 class ConversationCreate(BaseModel):
     title: Optional[str] = None
+    mode: Literal["single", "discussion", "agentic"] = "single"
     participants: Optional[List[ConversationParticipantUpdate]] = None
+    agentic_goal: Optional[str] = None
+    agentic_success_criteria: Optional[str] = None
+    agentic_scrape_url: Optional[str] = None
+    agentic_scrape_depth: Optional[int] = Field(default=1, ge=1, le=3)
+    agentic_report_format: Optional[str] = None
+    agentic_max_iterations: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_agentic_fields(self):
+        if self.mode == "agentic":
+            if not (self.agentic_goal or "").strip():
+                raise ValueError("Agentic conversations require a goal")
+            if not (self.agentic_success_criteria or "").strip():
+                raise ValueError("Agentic conversations require success criteria")
+            if not self.participants:
+                raise ValueError("Agentic conversations require at least one agent")
+        return self
 
 
 class ConversationTitleUpdate(BaseModel):
@@ -106,12 +152,24 @@ class ConversationModelUpdate(BaseModel):
     llm_model_id: int
 
 
+class AgenticControlRequest(BaseModel):
+    action: Literal["stop", "wrap"]
+
+
 class Conversation(BaseModel):
     id: int
     title: str
     sort_order: int
     llm_model_id: Optional[int] = None
     participant_count: int = 0
+    mode: str = "single"
+    agentic_goal: Optional[str] = None
+    agentic_success_criteria: Optional[str] = None
+    agentic_scrape_url: Optional[str] = None
+    agentic_scrape_depth: Optional[int] = None
+    agentic_report_format: Optional[str] = None
+    agentic_status: Optional[str] = None
+    agentic_max_iterations: Optional[int] = None
     created_at: str
     updated_at: str
 
@@ -128,6 +186,9 @@ class Message(BaseModel):
     generation_ms: Optional[int] = None
     include_history: Optional[Union[bool, int]] = None
     participant_id: Optional[int] = None
+    message_kind: Optional[str] = None
+    metadata: Optional[dict] = None
+    parent_message_id: Optional[int] = None
     created_at: str
 
 
@@ -158,12 +219,55 @@ class ConversationDetail(BaseModel):
     messages: List[Message]
     memories: List[Memory]
     participants: List[ConversationParticipantRead] = []
+    documents: List["Document"] = []
+
+
+class Document(BaseModel):
+    id: int
+    conversation_id: int
+    title: str
+    kind: str
+    content_markdown: str
+    source_filename: Optional[str] = None
+    source_media_type: Optional[str] = None
+    metadata: Optional[dict] = None
+    created_at: str
+    updated_at: str
+
+
+class DocumentCreate(BaseModel):
+    title: str = Field(min_length=1)
+    content_markdown: str = Field(min_length=1)
+    kind: Literal["uploaded", "generated_report", "generated_process"] = "uploaded"
+
+
+class DocumentWebsiteUploadRequest(BaseModel):
+    url: str = Field(min_length=1)
+    title: Optional[str] = None
+    depth: int = Field(default=1, ge=1, le=3)
+
+
+class DocumentUpdate(BaseModel):
+    title: Optional[str] = None
+    content_markdown: Optional[str] = None
+
+
+class DocumentUploadResponse(BaseModel):
+    document: Document
+
+
+class DocumentGenerateRequest(BaseModel):
+    title: str = Field(min_length=1)
+    format_request: Optional[str] = None
+    include_provenance: bool = True
 
 
 class MessageCreate(BaseModel):
     content: str = ""
     image_data: Optional[str] = None
     image_media_type: Optional[str] = None
+    agentic_start: bool = False
+    agentic_ad_hoc: bool = False
     include_history: Union[bool, int] = True
     include_memories: bool = True
     include_all_memories: bool = False
@@ -180,8 +284,10 @@ class MessageCreate(BaseModel):
     def validate_content_or_image(self):
         content = self.content.strip()
         image_data = (self.image_data or "").strip()
-        if not content and not image_data:
+        if not content and not image_data and not self.agentic_start:
             raise ValueError("Provide text, an image, or both")
+        if self.agentic_ad_hoc and not content:
+            raise ValueError("Ad-hoc agentic messages require text")
         if image_data and not (self.image_media_type or "").strip():
             raise ValueError("image_media_type is required when image_data is provided")
         return self
@@ -313,12 +419,15 @@ class PromptConfigRead(BaseModel):
     default_prompt_baseline: str
     multi_agent_prompt: str
     multi_agent_prompt_baseline: str
+    director_prompt: str
+    director_prompt_baseline: str
     updated_at: str
 
 
 class PromptConfigUpdate(BaseModel):
     default_prompt: str = Field(min_length=1)
     multi_agent_prompt: str = Field(min_length=1)
+    director_prompt: str = Field(min_length=1)
 
 
 class MemoryMapNodeSpec(BaseModel):
@@ -444,18 +553,19 @@ class UsageSummary(BaseModel):
     last_activity: Optional[str] = None
 
 
-class UsageDailyBucket(BaseModel):
-    date: str
-    user_messages: int
-    assistant_messages: int
-    total_messages: int
-
-
 class UsageModelBucket(BaseModel):
     provider: str
     model: str
     label: str
     message_count: int
+
+
+class UsageDailyBucket(BaseModel):
+    date: str
+    user_messages: int
+    assistant_messages: int
+    total_messages: int
+    model_requests: List[UsageModelBucket] = Field(default_factory=list)
 
 
 class UsageAgentBucket(BaseModel):
@@ -473,3 +583,4 @@ class UsageStatsRead(BaseModel):
 
 
 MemoryMapTreeNodeSpec.model_rebuild()
+ConversationDetail.model_rebuild()
