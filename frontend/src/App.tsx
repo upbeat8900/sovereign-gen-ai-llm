@@ -4316,6 +4316,13 @@ export default function App() {
     setPage("memories");
   }
 
+  function openDiscussion(conversationId: number) {
+    setActiveId(conversationId);
+    setPage("chat");
+    setSelectedMemoryIds([]);
+    setMergeText("");
+  }
+
   function sortMemoriesBy(sort: "created_at" | "title" | "llm_model") {
     setMemorySort((currentSort) => {
       if (currentSort === sort) {
@@ -5020,6 +5027,15 @@ export default function App() {
                         >
                           <span>{groupIsExpanded ? "▾" : "▸"}</span>
                           <strong>{group.conversation.title}</strong>
+                        </button>
+                        <button
+                          type="button"
+                          className="memory-group-open-discussion"
+                          title={`Open discussion: ${group.conversation.title}`}
+                          aria-label={`Open discussion: ${group.conversation.title}`}
+                          onClick={() => openDiscussion(group.conversation.id)}
+                        >
+                          <MessageCircle size={15} />
                         </button>
                         {activeId === group.conversation.id && <span className="current-discussion-pill">Current</span>}
                         <small>{sourceGroup.memories.length} memories</small>

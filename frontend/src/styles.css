@@ -1962,6 +1962,23 @@ button:disabled {
   text-align: left;
 }
 
+.memory-group-open-discussion {
+  align-items: center;
+  background: #dbeafe;
+  border: 1px solid #93c5fd;
+  border-radius: 10px;
+  color: #1d4ed8;
+  display: inline-flex;
+  flex-shrink: 0;
+  justify-content: center;
+  padding: 6px;
+}
+
+.memory-group-open-discussion:hover {
+  background: #bfdbfe;
+  color: #1e40af;
+}
+
 .memory-export-button {
   align-items: center;
   background: #ffffff;
