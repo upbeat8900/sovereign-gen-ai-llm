@@ -205,6 +205,23 @@ button {
   color: #1d4ed8;
 }
 
+.conversation-header-memories {
+  align-items: center;
+  background: #ede9fe;
+  border: 1px solid #a78bfa;
+  border-radius: 12px;
+  color: #7c3aed;
+  display: inline-flex;
+  flex-shrink: 0;
+  justify-content: center;
+  padding: 8px;
+}
+
+.conversation-header-memories:hover {
+  background: #ddd6fe;
+  color: #6d28d9;
+}
+
 .conversation-header-delete {
   align-items: center;
   background: #fee2e2;

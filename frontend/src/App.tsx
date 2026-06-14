@@ -1569,6 +1569,7 @@ export default function App() {
   const speechSelectionRef = useRef<{ messageId: number; text: string } | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingLatestScrollRef = useRef(false);
+  const expandConversationMemoriesRef = useRef<number | null>(null);
 
   const allMemories = useMemo(() => memoryGroups.flatMap((group) => group.memories), [memoryGroups]);
   const displayedElevenlabsCatalogVoices = useMemo(() => {
@@ -2977,6 +2978,17 @@ export default function App() {
   async function loadMemoryGroups() {
     const groups = await request<MemoryGroup[]>(`/api/memories?sort=${memorySort}&order=${memoryOrder}`);
     setMemoryGroups(groups);
+    const expandConversationId = expandConversationMemoriesRef.current;
+    if (expandConversationId) {
+      expandConversationMemoriesRef.current = null;
+      setExpandedMemoryGroupIds((current) =>
+        current.includes(expandConversationId) ? current : [...current, expandConversationId],
+      );
+      const targetGroup = groups.find((group) => group.conversation.id === expandConversationId);
+      if (targetGroup?.memories.length) {
+        setExpandedMemoryIds(targetGroup.memories.map((memory) => memory.id));
+      }
+    }
     if (activeId) {
       setExpandedMemoryGroupIds((current) => (current.includes(activeId) ? current : [...current, activeId]));
       setMergeTargetConversationId((current) => current || activeId);
@@ -4286,6 +4298,24 @@ export default function App() {
     );
   }
 
+  function openConversationMemories(conversationId: number) {
+    setExpandedMemoryGroupIds((current) =>
+      current.includes(conversationId) ? current : [...current, conversationId],
+    );
+    const cachedMemoryIds =
+      conversationId === activeId
+        ? (detail?.memories ?? []).map((memory) => memory.id)
+        : (memoryGroups.find((group) => group.conversation.id === conversationId)?.memories ?? []).map(
+            (memory) => memory.id,
+          );
+    if (cachedMemoryIds.length) {
+      setExpandedMemoryIds(cachedMemoryIds);
+    } else {
+      expandConversationMemoriesRef.current = conversationId;
+    }
+    setPage("memories");
+  }
+
   function sortMemoriesBy(sort: "created_at" | "title" | "llm_model") {
     setMemorySort((currentSort) => {
       if (currentSort === sort) {
@@ -4451,6 +4481,15 @@ export default function App() {
                           Participants
                         </button>
                       )}
+                      <button
+                        type="button"
+                        className="conversation-header-memories"
+                        title="View memories for this conversation"
+                        aria-label="View memories for this conversation"
+                        onClick={() => openConversationMemories(activeConversation.id)}
+                      >
+                        <Brain size={18} />
+                      </button>
                       <button
                         type="button"
                         className="conversation-header-delete"
