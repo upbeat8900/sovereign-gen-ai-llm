@@ -1020,6 +1020,17 @@ button {
   margin-top: 18px;
 }
 
+.agent-library-create-button {
+  background: #e2e8f0 !important;
+  color: #334155 !important;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.agent-library-create-button:hover:not(:disabled) {
+  background: #cbd5e1 !important;
+}
+
 .agent-library-list {
   display: grid;
   gap: 16px;

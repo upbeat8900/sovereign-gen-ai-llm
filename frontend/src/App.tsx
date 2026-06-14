@@ -1175,6 +1175,7 @@ export default function App() {
   const [agentProfiles, setAgentProfiles] = useState<AgentProfile[]>([]);
   const [savingAgentProfileIndex, setSavingAgentProfileIndex] = useState<number | null>(null);
   const [editingAgentProfile, setEditingAgentProfile] = useState<AgentProfile | null>(null);
+  const [isCreatingAgentProfile, setIsCreatingAgentProfile] = useState(false);
   const [agentProfileEditDraft, setAgentProfileEditDraft] = useState<ParticipantDraft | null>(null);
   const [savingAgentProfileEdit, setSavingAgentProfileEdit] = useState(false);
   const [participantEditorTarget, setParticipantEditorTarget] = useState<"new" | "edit">("new");
@@ -2310,36 +2311,62 @@ export default function App() {
   }
 
   function openAgentProfileEditor(profile: AgentProfile) {
+    setIsCreatingAgentProfile(false);
     setEditingAgentProfile(profile);
     setAgentProfileEditDraft(participantDraftFromProfile(profile));
     setError("");
   }
 
+  function openCreateAgentProfile() {
+    if (!config?.models.length) {
+      setError("Add an LLM model before creating agents");
+      return;
+    }
+    setIsCreatingAgentProfile(true);
+    setEditingAgentProfile(null);
+    setAgentProfileEditDraft(createParticipantDraft(config.models));
+    setError("");
+  }
+
   function closeAgentProfileEditor() {
+    setIsCreatingAgentProfile(false);
     setEditingAgentProfile(null);
     setAgentProfileEditDraft(null);
   }
 
   async function saveAgentProfileEdit(event?: FormEvent) {
     event?.preventDefault();
-    if (!editingAgentProfile || !agentProfileEditDraft?.name.trim()) {
+    if (!agentProfileEditDraft?.name.trim()) {
       setError("Agent name is required");
       return;
     }
     setSavingAgentProfileEdit(true);
     setError("");
     try {
-      const saved = await request<AgentProfile>(`/api/agent-profiles/${editingAgentProfile.id}`, {
-        method: "PUT",
-        body: JSON.stringify(agentProfilePayloadFromDraft(agentProfileEditDraft)),
-      });
-      setAgentProfiles((current) =>
-        [...current.filter((item) => item.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)),
-      );
-      closeAgentProfileEditor();
-      setNotice(`Updated agent "${saved.name}".`);
+      if (isCreatingAgentProfile) {
+        const saved = await request<AgentProfile>("/api/agent-profiles", {
+          method: "POST",
+          body: JSON.stringify(agentProfilePayloadFromDraft(agentProfileEditDraft)),
+        });
+        setAgentProfiles((current) =>
+          [...current.filter((item) => item.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)),
+        );
+        closeAgentProfileEditor();
+        setNotice(`Created agent "${saved.name}".`);
+      } else {
+        if (!editingAgentProfile) return;
+        const saved = await request<AgentProfile>(`/api/agent-profiles/${editingAgentProfile.id}`, {
+          method: "PUT",
+          body: JSON.stringify(agentProfilePayloadFromDraft(agentProfileEditDraft)),
+        });
+        setAgentProfiles((current) =>
+          [...current.filter((item) => item.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)),
+        );
+        closeAgentProfileEditor();
+        setNotice(`Updated agent "${saved.name}".`);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not update agent profile");
+      setError(err instanceof Error ? err.message : "Could not save agent profile");
     } finally {
       setSavingAgentProfileEdit(false);
     }
@@ -4391,8 +4418,19 @@ export default function App() {
                   <h2>Agent library</h2>
                   <p>Saved agents keep their name, personality, model, voice, and speech speed. Click an agent to edit it.</p>
                 </div>
+                <button
+                  type="button"
+                  className="secondary-button agent-library-create-button"
+                  onClick={openCreateAgentProfile}
+                  disabled={!config?.models.length}
+                >
+                  <Plus size={16} />
+                  Create new
+                </button>
               </div>
-              {!agentProfiles.length && <p className="hint">No saved agents yet. Create one in a multi-agent conversation and use Save to library.</p>}
+              {!agentProfiles.length && (
+                <p className="hint">No saved agents yet. Use Create new or save one from a multi-agent conversation.</p>
+              )}
               <div className="agent-library-list">
                 {agentProfiles.map((profile) => (
                   <article className="agent-library-item" key={profile.id}>
@@ -4781,7 +4819,7 @@ export default function App() {
         </div>
       )}
 
-      {editingAgentProfile && agentProfileEditDraft && config?.models.length && (
+      {(isCreatingAgentProfile || editingAgentProfile) && agentProfileEditDraft && config?.models.length && (
         <div className="modal-backdrop" role="presentation" onMouseDown={closeAgentProfileEditor}>
           <form
             className="modal-card agent-profile-modal"
@@ -4790,8 +4828,12 @@ export default function App() {
           >
             <div className="agent-profile-modal-header">
               <p className="eyebrow">Agent library</p>
-              <h2>{editingAgentProfile.name}</h2>
-              <p className="modal-copy">Changes apply when this agent is used in new or updated discussions.</p>
+              <h2>{isCreatingAgentProfile ? "New agent" : editingAgentProfile!.name}</h2>
+              <p className="modal-copy">
+                {isCreatingAgentProfile
+                  ? "Define a saved agent for multi-agent discussions."
+                  : "Changes apply when this agent is used in new or updated discussions."}
+              </p>
             </div>
             <AgentProfileFields
               draft={agentProfileEditDraft}
@@ -4808,12 +4850,12 @@ export default function App() {
                 {savingAgentProfileEdit ? (
                   <>
                     <Loader2 size={16} className="spin" />
-                    Saving...
+                    {isCreatingAgentProfile ? "Creating..." : "Saving..."}
                   </>
                 ) : (
                   <>
                     <Save size={16} />
-                    Save
+                    {isCreatingAgentProfile ? "Create" : "Save"}
                   </>
                 )}
               </button>
