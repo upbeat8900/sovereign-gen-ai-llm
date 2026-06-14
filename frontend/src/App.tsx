@@ -287,7 +287,7 @@ function historyLimitTitle(total: number, min: number, max: number) {
   return `${total} messages in request`;
 }
 const TTS_RATE_MIN = 0.5;
-const TTS_RATE_MAX = 2;
+const TTS_RATE_MAX = 2.5;
 const TTS_SAMPLE_TEXT = "Hello, this is a sample of how the assistant will sound when reading replies.";
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
