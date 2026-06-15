@@ -42,15 +42,19 @@ Your responsibilities:
 - Identify gaps explicitly before choosing the next action.
 - Use concise, user-visible rationale — not hidden chain-of-thought.
 - Delegate focused task packets to specialists; they only see what you send them.
+- Match each task to the specialist whose role/perspective fits best using the roster ids, names, and role descriptions.
+- If no specialist clearly fits, call consult_agents to gather every specialist's brief opinion, then choose who to delegate to (or synthesize) based on the success criteria.
+- When a task depends on conversation documents, list their ids in call_agent.document_ids and reference them in the task. Specialists receive the full document text automatically.
 - Use memories and documents as evidence; cite sources in summaries and reports.
-- Generate a Markdown task report when the deliverable warrants it or the user requested a format.
+- Generate a Markdown deliverable document when the task produces an artifact or the user requested a format.
+- The deliverable document must contain the actual output (draft post, memo, plan, analysis, etc.), not process notes.
 - Stop when success criteria are met, the user asks to stop, or iteration budget is exhausted.
 - Do not ask the user questions. If information is missing, proceed with explicit assumptions or use available specialists/tools.
 - Treat user messages added while you are running as ad-hoc clarifications. Incorporate them into the next step, but do not pause for more input.
 
 Respond with a single JSON object for your next action:
 {{
-  "action": "search_conversation_memories | search_all_memories | search_documents | read_document | scrape_website | call_agent | generate_report | complete",
+  "action": "search_conversation_memories | search_all_memories | search_documents | read_document | scrape_website | consult_agents | call_agent | generate_report | complete",
   "rationale": "short user-visible reason",
   "arguments": {{}},
   "expected_result": "what this action should clarify",
@@ -63,8 +67,9 @@ Action argument schemas:
 - search_documents: {{"query": "optional string"}}
 - read_document: {{"document_id": number}}
 - scrape_website: {{"query": "focus query for extraction"}}
-- call_agent: {{"participant_id": number, "task": "delegated work packet", "expected_output": "shape of answer"}}
-- generate_report: {{"title": "string", "format_request": "optional format", "include_provenance": true}}
+- consult_agents: {{"question": "brief question for every specialist", "expected_output": "shape of each opinion"}}
+- call_agent: {{"participant_id": number, "task": "delegated work packet", "expected_output": "shape of answer", "document_ids": [optional list of document ids whose full text the specialist needs]}}
+- generate_report: {{"title": "string", "content": "full deliverable markdown copied or compiled from specialist outputs", "format_request": "optional format", "include_provenance": true}}
 - complete: {{"final_answer": "string", "success_assessment": "string", "success_score": 0-100, "remaining_gaps": ["optional"]}}
 """
 
@@ -248,7 +253,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN ('uploaded', 'generated_report')),
+                kind TEXT NOT NULL CHECK (kind IN ('uploaded', 'generated_report', 'generated_process')),
                 content_markdown TEXT NOT NULL,
                 source_filename TEXT,
                 source_media_type TEXT,
@@ -293,10 +298,12 @@ def init_db() -> None:
         _ensure_column(connection, "conversations", "agentic_report_format", "TEXT")
         _ensure_column(connection, "conversations", "agentic_status", "TEXT")
         _ensure_column(connection, "conversations", "agentic_max_iterations", "INTEGER")
+        _ensure_column(connection, "conversations", "agentic_progress_json", "TEXT")
         _ensure_column(connection, "messages", "message_kind", "TEXT")
         _ensure_column(connection, "messages", "metadata_json", "TEXT")
         _ensure_column(connection, "messages", "parent_message_id", "INTEGER")
         _ensure_column(connection, "app_config", "director_prompt", "TEXT")
+        _ensure_documents_kind_constraint(connection)
         _backfill_conversation_modes(connection)
         _backfill_memory_titles(connection)
         _ensure_column(connection, "memories", "title_generated_at", "TEXT")
@@ -331,6 +338,45 @@ def _ensure_column(connection: sqlite3.Connection, table: str, column: str, colu
     existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def _ensure_documents_kind_constraint(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
+    ).fetchone()
+    if not row or "generated_process" in (row["sql"] or ""):
+        return
+
+    connection.executescript(
+        """
+        CREATE TABLE documents_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('uploaded', 'generated_report', 'generated_process')),
+            content_markdown TEXT NOT NULL,
+            source_filename TEXT,
+            source_media_type TEXT,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            archived_at TEXT,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+
+        INSERT INTO documents_new (
+            id, conversation_id, title, kind, content_markdown, source_filename,
+            source_media_type, metadata_json, created_at, updated_at, archived_at
+        )
+        SELECT
+            id, conversation_id, title, kind, content_markdown, source_filename,
+            source_media_type, metadata_json, created_at, updated_at, archived_at
+        FROM documents;
+
+        DROP TABLE documents;
+        ALTER TABLE documents_new RENAME TO documents;
+        """
+    )
 
 
 def _backfill_memory_titles(connection: sqlite3.Connection) -> None:

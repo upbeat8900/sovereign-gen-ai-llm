@@ -68,8 +68,24 @@ type Conversation = {
   agentic_report_format?: string | null;
   agentic_status?: string | null;
   agentic_max_iterations?: number | null;
+  agentic_progress?: AgenticProgress | null;
   created_at: string;
   updated_at: string;
+};
+
+type AgenticProgress = {
+  phase?: string;
+  status?: string;
+  current_url?: string;
+  current_depth?: number;
+  pages_scraped?: number;
+  queued_pages?: number;
+  last_page_chars?: number;
+  extracted_chars?: number;
+  rendered_pages?: number;
+  used_rendered_dom?: boolean;
+  depth?: number;
+  max_pages?: number;
 };
 
 type ConversationParticipant = {
@@ -180,6 +196,16 @@ type ConversationDetail = {
 type MemoryGroup = {
   conversation: Conversation;
   memories: Memory[];
+};
+
+type DocumentGroup = {
+  conversation: Conversation;
+  documents: DocumentItem[];
+};
+
+type ExistingDocumentOption = {
+  conversation: Conversation;
+  document: DocumentItem;
 };
 
 type LlmModel = {
@@ -1182,6 +1208,7 @@ type GenerationJob = {
   completedSteps?: number;
   currentParticipantName?: string;
   currentStepLabel?: string;
+  scrapeProgress?: AgenticProgress | null;
   initialMessageCount?: number;
   speakReplies?: boolean;
   autoPlayReplies?: boolean;
@@ -1806,8 +1833,12 @@ export default function App() {
   const [newAgenticScrapeDepth, setNewAgenticScrapeDepth] = useState(1);
   const [newAgenticReportFormat, setNewAgenticReportFormat] = useState("");
   const [newAgenticMaxIterations, setNewAgenticMaxIterations] = useState(20);
+  const [newAgenticDirectorModelId, setNewAgenticDirectorModelId] = useState<number | null>(null);
   const [newAgenticInputDocumentTitle, setNewAgenticInputDocumentTitle] = useState("");
   const [newAgenticInputDocumentContent, setNewAgenticInputDocumentContent] = useState("");
+  const [selectedExistingInputDocument, setSelectedExistingInputDocument] = useState<ExistingDocumentOption | null>(null);
+  const [isExistingDocumentModalOpen, setIsExistingDocumentModalOpen] = useState(false);
+  const [loadingExistingDocuments, setLoadingExistingDocuments] = useState(false);
   const [isParticipantsModalOpen, setIsParticipantsModalOpen] = useState(false);
   const [isAgenticSetupModalOpen, setIsAgenticSetupModalOpen] = useState(false);
   const [participantsDraft, setParticipantsDraft] = useState<ParticipantDraft[]>([]);
@@ -1820,6 +1851,8 @@ export default function App() {
   const [agentProfileEditDraft, setAgentProfileEditDraft] = useState<ParticipantDraft | null>(null);
   const [savingAgentProfileEdit, setSavingAgentProfileEdit] = useState(false);
   const [generatingAgentPersonality, setGeneratingAgentPersonality] = useState(false);
+  const [isAgentPersonalityModelModalOpen, setIsAgentPersonalityModelModalOpen] = useState(false);
+  const [agentPersonalityModelId, setAgentPersonalityModelId] = useState<number | null>(null);
   const [participantEditorTarget, setParticipantEditorTarget] = useState<"new" | "edit">("new");
   const [discussionRounds, setDiscussionRounds] = useState(readStoredDiscussionRounds);
   const [multiAgentModelOverrideId, setMultiAgentModelOverrideId] = useState<number | null>(null);
@@ -1827,7 +1860,9 @@ export default function App() {
   const [deleteConversationTarget, setDeleteConversationTarget] = useState<Conversation | null>(null);
   const [deleteMessageCount, setDeleteMessageCount] = useState(0);
   const [deleteMemoryCount, setDeleteMemoryCount] = useState(0);
+  const [deleteDocumentCount, setDeleteDocumentCount] = useState(0);
   const [deleteMemoryAction, setDeleteMemoryAction] = useState<"delete" | "move">("delete");
+  const [deleteDocumentAction, setDeleteDocumentAction] = useState<"delete" | "move">("delete");
   const [deleteTargetId, setDeleteTargetId] = useState<number | "">("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -1882,7 +1917,11 @@ export default function App() {
   const [directorPromptDraft, setDirectorPromptDraft] = useState("");
   const [selectedDocument, setSelectedDocument] = useState<DocumentItem | null>(null);
   const [documentSearch, setDocumentSearch] = useState("");
+  const [documentGroups, setDocumentGroups] = useState<DocumentGroup[]>([]);
+  const [expandedDocumentGroupIds, setExpandedDocumentGroupIds] = useState<number[]>([]);
   const [documentUploadBusy, setDocumentUploadBusy] = useState(false);
+  const [isDocumentUploadTargetModalOpen, setIsDocumentUploadTargetModalOpen] = useState(false);
+  const [documentUploadTargetConversationId, setDocumentUploadTargetConversationId] = useState<number | null>(null);
   const [documentWebsiteUploadBusy, setDocumentWebsiteUploadBusy] = useState(false);
   const [documentWebsiteUrl, setDocumentWebsiteUrl] = useState("");
   const [documentWebsiteTitle, setDocumentWebsiteTitle] = useState("");
@@ -2098,18 +2137,53 @@ export default function App() {
       allowSinglePlaceholder: Boolean(job && !job.isMultiAgent && !job.isAgentic),
     });
   }, [detail?.messages, activeId, generationJobs, isMultiAgentConversation, isAgenticConversation]);
-  const visibleDocuments = useMemo(() => {
-    const documents = detail?.documents ?? [];
-    const needle = documentSearch.trim().toLowerCase();
-    if (!needle) return documents;
-    return documents.filter(
-      (document) =>
-        document.title.toLowerCase().includes(needle) ||
-        document.content_markdown.toLowerCase().includes(needle) ||
-        document.kind.toLowerCase().includes(needle),
-    );
-  }, [detail?.documents, documentSearch]);
-
+  const documentSearchTerms = useMemo(() => parseSearchTerms(documentSearch), [documentSearch]);
+  const visibleDocumentGroups = useMemo(() => {
+    if (!documentSearchTerms.length) return documentGroups;
+    return documentGroups
+      .map((group) => {
+        const documents = group.documents.filter((document) => {
+          const text = [
+            group.conversation.title,
+            document.title,
+            document.content_markdown,
+            document.kind,
+            document.source_filename ?? "",
+            document.source_media_type ?? "",
+          ]
+            .join(" ")
+            .toLowerCase();
+          return documentSearchTerms.every((term) => text.includes(term));
+        });
+        return { ...group, documents };
+      })
+      .filter((group) => group.documents.length > 0);
+  }, [documentGroups, documentSearchTerms]);
+  const documentUploadConversationOptions = useMemo(
+    () =>
+      [...conversations].sort(
+        (left, right) =>
+          new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime() || right.id - left.id,
+      ),
+    [conversations],
+  );
+  const existingDocumentOptions = useMemo(
+    () =>
+      documentGroups
+        .flatMap((group) => group.documents.map((document) => ({ conversation: group.conversation, document })))
+        .sort((left, right) => {
+          const conversationComparison = left.conversation.title.localeCompare(right.conversation.title, undefined, {
+            sensitivity: "base",
+          });
+          if (conversationComparison !== 0) return conversationComparison;
+          const titleComparison = left.document.title.localeCompare(right.document.title, undefined, {
+            sensitivity: "base",
+          });
+          if (titleComparison !== 0) return titleComparison;
+          return new Date(left.document.created_at).getTime() - new Date(right.document.created_at).getTime();
+        }),
+    [documentGroups],
+  );
   const historyContextOverhead = llmContextOverhead(
     detail?.memories.length ?? 0,
     includeMemories,
@@ -2276,6 +2350,17 @@ export default function App() {
   }, [isNewConversationModalOpen, newConversationMode, config, newConversationParticipants.length]);
 
   useEffect(() => {
+    if (
+      isNewConversationModalOpen &&
+      newConversationMode === "agentic" &&
+      config?.active_model?.id &&
+      newAgenticDirectorModelId == null
+    ) {
+      setNewAgenticDirectorModelId(config.active_model.id ?? null);
+    }
+  }, [isNewConversationModalOpen, newConversationMode, config, newAgenticDirectorModelId]);
+
+  useEffect(() => {
     if (page === "settings") {
       void loadSpeechConfig();
       void loadPromptConfig();
@@ -2344,6 +2429,7 @@ export default function App() {
       setIsConversationModelModalOpen(false);
       setExpandedMemoryIds([]);
       setExpandedMemoryGroupIds((current) => (current.includes(activeId) ? current : [...current, activeId]));
+      setExpandedDocumentGroupIds((current) => (current.includes(activeId) ? current : [...current, activeId]));
       setMergeTargetConversationId((current) => current || activeId);
     } else {
       setDetail(null);
@@ -2371,7 +2457,13 @@ export default function App() {
   }, [page, memorySort, memoryOrder, activeId]);
 
   useEffect(() => {
-    if (page !== "chat" || !userMessageIds.length || pendingLatestScrollRef.current) return;
+    if (page === "documents") {
+      loadDocumentGroups();
+    }
+  }, [page, activeId]);
+
+  useEffect(() => {
+    if (page !== "chat" || !userMessageIds.length || pendingLatestScrollRef.current || isAgenticConversation) return;
     const latestUserMessageId = userMessageIds[userMessageIds.length - 1];
     requestAnimationFrame(() => {
       document.getElementById(`message-${latestUserMessageId}`)?.scrollIntoView({
@@ -2379,7 +2471,7 @@ export default function App() {
         behavior: "auto",
       });
     });
-  }, [page, userMessageIds]);
+  }, [page, userMessageIds, isAgenticConversation]);
 
   useEffect(() => {
     if (!pendingLatestScrollRef.current || page !== "chat" || activeId !== latestConversation?.id) return;
@@ -2669,11 +2761,25 @@ export default function App() {
   }
 
   function shouldAutoPlayAssistantReplies(conversationId: number) {
-    if (speakRepliesByConversationRef.current[conversationId]) {
-      return true;
+    return Boolean(speakRepliesByConversationRef.current[conversationId]);
+  }
+
+  function enableAssistantReplyAutoPlay(conversationId: number, message: Message, messages: Message[]) {
+    const messageIndex = messages.findIndex((item) => item.id === message.id);
+    if (messageIndex < 0) return;
+    speakRepliesByConversationRef.current[conversationId] = true;
+    speakReplyStartIndexByConversationRef.current[conversationId] = messageIndex;
+    const spoken =
+      spokenMessageIdsByConversationRef.current[conversationId] ??
+      (spokenMessageIdsByConversationRef.current[conversationId] = new Set());
+    spoken.add(message.id);
+  }
+
+  function handleStopAssistantSpeech() {
+    if (activeIdRef.current != null) {
+      speakRepliesByConversationRef.current[activeIdRef.current] = false;
     }
-    const job = generationJobsRef.current[conversationId];
-    return Boolean(job?.isMultiAgent && job.autoPlayReplies);
+    stopSpeechPlayback();
   }
 
   function beginAssistantReplyPlayback(conversationId: number, initialMessageCount: number) {
@@ -2889,6 +2995,9 @@ export default function App() {
     const captured = speechSelectionRef.current;
     speechSelectionRef.current = null;
     const selected = captured?.messageId === message.id ? captured.text : undefined;
+    if (activeIdRef.current != null) {
+      enableAssistantReplyAutoPlay(activeIdRef.current, message, detail?.messages ?? []);
+    }
     playAssistantMessage(message, selected);
   }
 
@@ -3136,6 +3245,9 @@ export default function App() {
       if (activeId === conversationId) {
         await loadConversation(conversationId);
       }
+      if (page === "documents") {
+        await loadDocumentGroups();
+      }
       setSelectedDocument(payload.document);
       setNotice(`Uploaded ${payload.document.title}`);
     } catch (err) {
@@ -3143,6 +3255,19 @@ export default function App() {
     } finally {
       setDocumentUploadBusy(false);
     }
+  }
+
+  function openDocumentUploadTargetModal() {
+    setError("");
+    const defaultConversationId = activeId ?? documentUploadConversationOptions[0]?.id ?? null;
+    setDocumentUploadTargetConversationId(defaultConversationId);
+    setIsDocumentUploadTargetModalOpen(true);
+  }
+
+  function chooseDocumentUploadTarget(conversationId: number) {
+    setDocumentUploadTargetConversationId(conversationId);
+    setIsDocumentUploadTargetModalOpen(false);
+    requestAnimationFrame(() => documentUploadInputRef.current?.click());
   }
 
   async function uploadWebsiteDocument(event: FormEvent) {
@@ -3168,6 +3293,9 @@ export default function App() {
         },
       );
       await loadConversation(activeId);
+      if (page === "documents") {
+        await loadDocumentGroups();
+      }
       setSelectedDocument(payload.document);
       setDocumentWebsiteUrl("");
       setDocumentWebsiteTitle("");
@@ -3193,6 +3321,10 @@ export default function App() {
         kind: "uploaded",
       }),
     });
+  }
+
+  async function copyExistingInputDocument(conversationId: number, option: ExistingDocumentOption) {
+    return createPastedInputDocument(conversationId, option.document.title, option.document.content_markdown);
   }
 
   function mergeDetailPreservingOptimistic(
@@ -3297,6 +3429,7 @@ export default function App() {
       };
     });
     requestAnimationFrame(() => {
+      if (isAgenticConversation) return;
       const messagesEl = document.querySelector(".messages");
       if (messagesEl) {
         messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -3410,9 +3543,15 @@ export default function App() {
     if (job?.isAgentic && job.initialMessageCount != null) {
       const newSteps = data.messages.slice(job.initialMessageCount + 1).filter((message) => message.message_kind);
       const lastStep = newSteps[newSteps.length - 1];
+      const scrapeProgress = data.conversation.agentic_progress ?? null;
       updateGenerationJob(conversationId, {
         completedSteps: newSteps.length,
-        currentStepLabel: lastStep ? directorStepLabel(lastStep.message_kind) : job.currentStepLabel,
+        currentStepLabel: scrapeProgress
+          ? "Extracting website content"
+          : lastStep
+            ? directorStepLabel(lastStep.message_kind)
+            : job.currentStepLabel,
+        scrapeProgress,
       });
     }
     maybeSpeakPendingAssistantReplies(conversationId, data.messages, data.participants);
@@ -3531,6 +3670,31 @@ export default function App() {
       if (activeGroup) {
         setDetail((current) => current && { ...current, memories: activeGroup.memories });
       }
+    }
+  }
+
+  async function loadDocumentGroups() {
+    const groups = await request<DocumentGroup[]>("/api/documents");
+    setDocumentGroups(groups);
+    if (activeId) {
+      setExpandedDocumentGroupIds((current) => (current.includes(activeId) ? current : [...current, activeId]));
+      const activeGroup = groups.find((group) => group.conversation.id === activeId);
+      if (activeGroup) {
+        setDetail((current) => current && { ...current, documents: activeGroup.documents });
+      }
+    }
+  }
+
+  async function openExistingDocumentModal() {
+    setIsExistingDocumentModalOpen(true);
+    setLoadingExistingDocuments(true);
+    setError("");
+    try {
+      await loadDocumentGroups();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load existing documents");
+    } finally {
+      setLoadingExistingDocuments(false);
     }
   }
 
@@ -3688,12 +3852,35 @@ export default function App() {
     setEditingAgentProfile(null);
     setAgentProfileEditDraft(null);
     setGeneratingAgentPersonality(false);
+    setIsAgentPersonalityModelModalOpen(false);
+    setAgentPersonalityModelId(null);
+  }
+
+  function openAgentPersonalityModelModal() {
+    const draft = agentProfileEditDraft;
+    if (!draft?.name.trim()) {
+      setError("Agent name is required before drafting a personality");
+      return;
+    }
+    const defaultModelId = config?.active_model.id ?? config?.models[0]?.id ?? null;
+    setAgentPersonalityModelId(defaultModelId ?? null);
+    setIsAgentPersonalityModelModalOpen(true);
+    setError("");
+  }
+
+  function closeAgentPersonalityModelModal() {
+    if (generatingAgentPersonality) return;
+    setIsAgentPersonalityModelModalOpen(false);
   }
 
   async function generateAgentPersonalityDraft() {
     const draft = agentProfileEditDraft;
     if (!draft?.name.trim()) {
       setError("Agent name is required before drafting a personality");
+      return;
+    }
+    if (agentPersonalityModelId == null) {
+      setError("Choose an LLM model before drafting a personality");
       return;
     }
 
@@ -3705,6 +3892,7 @@ export default function App() {
         body: JSON.stringify({
           name: draft.name.trim(),
           seed_personality: draft.personality,
+          llm_model_id: agentPersonalityModelId,
         }),
       });
       setAgentProfileEditDraft((current) =>
@@ -3715,7 +3903,13 @@ export default function App() {
             }
           : current,
       );
-      setNotice("Drafted personality with the default LLM.");
+      setIsAgentPersonalityModelModalOpen(false);
+      const selectedModel = config?.models.find((model) => model.id === agentPersonalityModelId);
+      setNotice(
+        selectedModel
+          ? `Drafted personality with ${selectedModel.model}.`
+          : "Drafted personality with the selected LLM.",
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not draft agent personality");
     } finally {
@@ -3900,6 +4094,7 @@ export default function App() {
       agentic_scrape_depth?: number;
       agentic_report_format?: string;
       agentic_max_iterations?: number;
+      llm_model_id?: number;
     } = {
       title: newTitle || undefined,
       mode: newConversationMode === "single" ? "single" : newConversationMode,
@@ -3926,6 +4121,7 @@ export default function App() {
       payload.agentic_scrape_depth = newAgenticScrapeDepth;
       payload.agentic_report_format = newAgenticReportFormat.trim() || undefined;
       payload.agentic_max_iterations = newAgenticMaxIterations;
+      payload.llm_model_id = newAgenticDirectorModelId ?? config?.active_model?.id ?? undefined;
     } else if (newConversationSingleCharacterId != null) {
       const profile = agentProfiles.find((item) => item.id === newConversationSingleCharacterId);
       if (profile) {
@@ -3934,10 +4130,14 @@ export default function App() {
     }
     const pastedInputDocumentTitle = newAgenticInputDocumentTitle.trim();
     const pastedInputDocumentContent = newAgenticInputDocumentContent.trim();
+    const existingInputDocument = selectedExistingInputDocument;
     const conversation = await request<Conversation>("/api/conversations", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    if (newConversationMode === "agentic" && existingInputDocument) {
+      await copyExistingInputDocument(conversation.id, existingInputDocument);
+    }
     if (newConversationMode === "agentic" && pastedInputDocumentContent) {
       await createPastedInputDocument(conversation.id, pastedInputDocumentTitle, pastedInputDocumentContent);
     }
@@ -3951,8 +4151,10 @@ export default function App() {
     setNewAgenticScrapeDepth(1);
     setNewAgenticReportFormat("");
     setNewAgenticMaxIterations(20);
+    setNewAgenticDirectorModelId(config?.active_model?.id ?? null);
     setNewAgenticInputDocumentTitle("");
     setNewAgenticInputDocumentContent("");
+    setSelectedExistingInputDocument(null);
     setIsNewConversationModalOpen(false);
     setConversations((current) => [conversation, ...current]);
     setActiveId(conversation.id);
@@ -4029,8 +4231,10 @@ export default function App() {
     setNewAgenticScrapeDepth(1);
     setNewAgenticReportFormat("");
     setNewAgenticMaxIterations(20);
+    setNewAgenticDirectorModelId(config?.active_model?.id ?? null);
     setNewAgenticInputDocumentTitle("");
     setNewAgenticInputDocumentContent("");
+    setSelectedExistingInputDocument(null);
     setParticipantEditorTarget("new");
     setIsNewConversationModalOpen(true);
   }
@@ -4061,6 +4265,7 @@ export default function App() {
     setNewAgenticScrapeDepth(detail.conversation.agentic_scrape_depth ?? 1);
     setNewAgenticReportFormat(detail.conversation.agentic_report_format ?? "");
     setNewAgenticMaxIterations(detail.conversation.agentic_max_iterations ?? 20);
+    setNewAgenticDirectorModelId(detail.conversation.llm_model_id ?? config?.active_model?.id ?? null);
     setParticipantsDraft(
       detail.participants.map((participant) => ({
         llm_model_id: participant.llm_model_id,
@@ -4134,6 +4339,7 @@ export default function App() {
           agentic_scrape_depth: newAgenticScrapeDepth,
           agentic_report_format: newAgenticReportFormat.trim() || null,
           agentic_max_iterations: newAgenticMaxIterations,
+          llm_model_id: newAgenticDirectorModelId ?? config?.active_model?.id,
         }),
       });
       setDetail(updated);
@@ -4141,7 +4347,8 @@ export default function App() {
         current.map((item) => (item.id === updated.conversation.id ? updated.conversation : item)),
       );
       setIsAgenticSetupModalOpen(false);
-      setNotice("Agentic setup updated.");
+      setNotice("Agentic setup saved. Launching Director...");
+      void startAgenticRun(updated.conversation);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not update agentic setup");
     } finally {
@@ -4290,8 +4497,12 @@ export default function App() {
     setDeleteConversationTarget(conversation);
     setDeleteMessageCount(cachedDetail ? cachedDetail.messages.filter((message) => message.id >= 0).length : 0);
     setDeleteMemoryCount(cachedDetail?.memories.length ?? 0);
+    setDeleteDocumentCount(cachedDetail?.documents?.length ?? 0);
     setDeleteMemoryAction(
       (cachedDetail?.memories.length ?? 0) > 0 && destinations.length > 0 ? "move" : "delete",
+    );
+    setDeleteDocumentAction(
+      (cachedDetail?.documents?.length ?? 0) > 0 && destinations.length > 0 ? "move" : "delete",
     );
     setDeleteTargetId(destinations[0]?.id ?? "");
 
@@ -4299,7 +4510,9 @@ export default function App() {
       const conversationDetail = await request<ConversationDetail>(`/api/conversations/${conversation.id}`);
       setDeleteMessageCount(conversationDetail.messages.filter((message) => message.id >= 0).length);
       setDeleteMemoryCount(conversationDetail.memories.length);
+      setDeleteDocumentCount(conversationDetail.documents?.length ?? 0);
       setDeleteMemoryAction(conversationDetail.memories.length > 0 && destinations.length > 0 ? "move" : "delete");
+      setDeleteDocumentAction((conversationDetail.documents?.length ?? 0) > 0 && destinations.length > 0 ? "move" : "delete");
       setDeleteTargetId(destinations[0]?.id ?? "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load conversation details");
@@ -4316,7 +4529,9 @@ export default function App() {
         method: "POST",
         body: JSON.stringify({
           memory_action: deleteMemoryAction,
-          target_conversation_id: deleteMemoryAction === "move" ? deleteTargetId : undefined,
+          document_action: deleteDocumentAction,
+          target_conversation_id:
+            deleteMemoryAction === "move" || deleteDocumentAction === "move" ? deleteTargetId : undefined,
         }),
       });
 
@@ -4334,7 +4549,9 @@ export default function App() {
       setDeleteConversationTarget(null);
       setDeleteMessageCount(0);
       setDeleteMemoryCount(0);
+      setDeleteDocumentCount(0);
       setDeleteMemoryAction("delete");
+      setDeleteDocumentAction("delete");
       setDeleteTargetId("");
       setNotice("Conversation deleted.");
     } catch (err) {
@@ -4560,7 +4777,7 @@ export default function App() {
         currentStepLabel: isAgenticConversation ? "Director planning" : undefined,
         initialMessageCount,
         speakReplies: options?.speakReply ?? false,
-        autoPlayReplies: isMultiAgentConversation,
+        autoPlayReplies: false,
         participants: isMultiAgentConversation ? activeParticipants : undefined,
         rounds: roundsForThisSend,
         overrideLlmModelId: isMultiAgentConversation ? multiAgentModelOverrideId : undefined,
@@ -4586,7 +4803,7 @@ export default function App() {
     setError("");
     setNotice("");
 
-    if (isMultiAgentConversation || isAgenticConversation || options?.speakReply) {
+    if (speakRepliesByConversationRef.current[conversationId] || options?.speakReply) {
       beginAssistantReplyPlayback(conversationId, initialMessageCount);
     }
     if (options?.speakReply) {
@@ -4654,7 +4871,6 @@ export default function App() {
       await loadConversation(conversationId);
       removeGenerationJob(conversationId);
       await loadConversations();
-      speakRepliesByConversationRef.current[conversationId] = false;
 
       if (isMultiAgentConversation && roundsForThisSend > 1) {
         setDiscussionRounds(1);
@@ -4674,9 +4890,6 @@ export default function App() {
       }
     } catch (err) {
       removeGenerationJob(conversationId);
-      speakRepliesByConversationRef.current[conversationId] = false;
-      delete speakReplyStartIndexByConversationRef.current[conversationId];
-      delete spokenMessageIdsByConversationRef.current[conversationId];
       if (isAbortError(err)) {
         if (activeIdRef.current === conversationId) {
           setNotice("Generation cancelled.");
@@ -4885,6 +5098,23 @@ export default function App() {
     await loadMemoryGroups();
     if (activeId === memory.conversation_id) {
       await loadConversation(activeId);
+    }
+  }
+
+  async function deleteDocument(document: DocumentItem) {
+    setError("");
+    try {
+      await request(`/api/conversations/${document.conversation_id}/documents/${document.id}`, { method: "DELETE" });
+      if (selectedDocument?.id === document.id) {
+        setSelectedDocument(null);
+      }
+      await loadDocumentGroups();
+      if (activeId === document.conversation_id) {
+        await loadConversation(activeId);
+      }
+      setNotice(`Deleted document: ${document.title}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete document");
     }
   }
 
@@ -5105,8 +5335,17 @@ export default function App() {
     );
   }
 
+  function toggleExpandedDocumentGroup(conversationId: number) {
+    setExpandedDocumentGroupIds((current) =>
+      current.includes(conversationId) ? current.filter((id) => id !== conversationId) : [...current, conversationId],
+    );
+  }
+
   function openConversationDocuments(conversationId: number) {
     setDocumentSearch("");
+    setExpandedDocumentGroupIds((current) =>
+      current.includes(conversationId) ? current : [...current, conversationId],
+    );
     setActiveId(conversationId);
     setPage("documents");
   }
@@ -5458,7 +5697,9 @@ export default function App() {
                   <article
                     id={`message-${message.id}`}
                     key={message.id}
-                    className={`message ${message.role}${isSpeaking ? " message-being-read" : ""}${isDirectorStep ? " message-director-step" : ""}`}
+                    className={`message ${message.role}${isSpeaking ? " message-being-read" : ""}${isDirectorStep ? " message-director-step" : ""}${
+                      message.message_kind ? ` message-kind-${message.message_kind}` : ""
+                    }`}
                   >
                     <div className="message-meta">
                       <strong title={participant?.personality?.trim() || undefined}>
@@ -5494,7 +5735,7 @@ export default function App() {
                                 type="button"
                                 className="message-speech-active"
                                 title="Stop playback"
-                                onClick={stopSpeechPlayback}
+                                onClick={handleStopAssistantSpeech}
                               >
                                 <Square size={15} />
                               </button>
@@ -5699,7 +5940,11 @@ export default function App() {
                     : isTranscribing
                       ? "Transcribing speech..."
                       : activeId
-                        ? "Ask something, paste an image, or type 'remember this message'..."
+                        ? activeGenerationJob?.isAgentic
+                          ? "Send an ad-hoc clarification to the running Director..."
+                          : isAgenticConversation
+                            ? "Add instructions or context, then send to relaunch the Director..."
+                            : "Ask something, paste an image, or type 'remember this message'..."
                         : "Create a conversation first..."
                 }
                 value={input}
@@ -5776,7 +6021,9 @@ export default function App() {
                             ? "Thinking..."
                             : isRecording
                               ? "Stop & send"
-                              : "Send"}
+                              : isAgenticConversation
+                                ? "Relaunch Director"
+                                : "Send"}
                     </button>
                   </div>
                   <div className="composer-model-controls">
@@ -5823,7 +6070,7 @@ export default function App() {
                       <button
                         type="button"
                         className="model-pill composer-model-pill"
-                        title="Choose discussion model"
+                        title={isAgenticConversation ? "Choose Director model" : "Choose discussion model"}
                         onClick={() => setIsConversationModelModalOpen(true)}
                         disabled={!detail || !config?.models.length}
                       >
@@ -6045,7 +6292,9 @@ export default function App() {
                           onClick={() => toggleExpandedMemoryGroup(group.conversation.id)}
                         >
                           <span>{groupIsExpanded ? "▾" : "▸"}</span>
-                          <strong>{group.conversation.title}</strong>
+                          <strong>
+                            {group.conversation.title} ({sourceGroup.memories.length})
+                          </strong>
                         </button>
                         <button
                           type="button"
@@ -6217,7 +6466,7 @@ export default function App() {
             <header className="page-header">
               <div>
                 <p className="eyebrow">Documents</p>
-                <h1>{detail?.conversation.title ?? "Select a conversation"}</h1>
+                <h1>Documents by discussion</h1>
               </div>
               <div className="memory-toolbar">
                 <input
@@ -6233,13 +6482,14 @@ export default function App() {
                   onChange={(event) => {
                     const file = event.target.files?.[0];
                     event.target.value = "";
-                    if (file && activeId) void uploadDocument(file, activeId);
+                    const targetConversationId = documentUploadTargetConversationId ?? activeId;
+                    if (file && targetConversationId) void uploadDocument(file, targetConversationId);
                   }}
                 />
                 <button
                   type="button"
-                  disabled={!activeId || documentUploadBusy}
-                  onClick={() => documentUploadInputRef.current?.click()}
+                  disabled={!documentUploadConversationOptions.length || documentUploadBusy}
+                  onClick={openDocumentUploadTargetModal}
                 >
                   {documentUploadBusy ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
                   Upload document
@@ -6288,23 +6538,74 @@ export default function App() {
               </button>
             </form>
             <div className="documents-list">
-              {!activeId && <div className="empty-card">Select a conversation to view its documents.</div>}
-              {activeId && !visibleDocuments.length && (
-                <div className="empty-card">No documents yet. Upload Markdown, text, or PDF, or generate one in agentic mode.</div>
+              {visibleDocumentGroups.map((group) => {
+                const groupIsExpanded =
+                  documentSearchTerms.length > 0 || expandedDocumentGroupIds.includes(group.conversation.id);
+                const sourceGroup = documentGroups.find((candidate) => candidate.conversation.id === group.conversation.id) ?? group;
+                return (
+                  <section key={group.conversation.id} className="memory-group document-group">
+                    <div className="memory-group-header">
+                      <button
+                        type="button"
+                        className="memory-group-title-button"
+                        onClick={() => toggleExpandedDocumentGroup(group.conversation.id)}
+                      >
+                        <span>{groupIsExpanded ? "▾" : "▸"}</span>
+                        <strong>
+                          {group.conversation.title} ({sourceGroup.documents.length})
+                        </strong>
+                      </button>
+                      <button
+                        type="button"
+                        className="memory-group-open-discussion"
+                        title={`Open discussion: ${group.conversation.title}`}
+                        aria-label={`Open discussion: ${group.conversation.title}`}
+                        onClick={() => openDiscussion(group.conversation.id)}
+                      >
+                        <MessageCircle size={15} />
+                      </button>
+                      {activeId === group.conversation.id && <span className="current-discussion-pill">Current</span>}
+                      <small>{sourceGroup.documents.length} documents</small>
+                    </div>
+
+                    {groupIsExpanded && (
+                      <div className="memory-group-items">
+                        {group.documents.length === 0 && <div className="empty-card">No documents in this discussion yet.</div>}
+                        {group.documents.map((document) => (
+                          <article className="document-row" key={document.id}>
+                            <button type="button" className="document-row-main" onClick={() => setSelectedDocument(document)}>
+                              <strong>{document.title}</strong>
+                              <small>
+                                {documentKindLabel(document.kind)} · {formatDate(document.updated_at)}
+                              </small>
+                            </button>
+                            <button type="button" title="Download PDF" onClick={() => openDocumentPdf(document)}>
+                              <FileDown size={16} />
+                            </button>
+                            <button
+                              type="button"
+                              className="document-delete-button"
+                              title="Delete document"
+                              aria-label={`Delete document: ${document.title}`}
+                              onClick={() => void deleteDocument(document)}
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                );
+              })}
+              {documentGroups.every((group) => group.documents.length === 0) && (
+                <div className="empty-card">
+                  No documents yet. Upload Markdown, text, or PDF, import a website, or generate one in agentic mode.
+                </div>
               )}
-              {visibleDocuments.map((document) => (
-                <article className="document-row" key={document.id}>
-                  <button type="button" className="document-row-main" onClick={() => setSelectedDocument(document)}>
-                    <strong>{document.title}</strong>
-                    <small>
-                      {documentKindLabel(document.kind)} · {formatDate(document.updated_at)}
-                    </small>
-                  </button>
-                  <button type="button" title="Download PDF" onClick={() => openDocumentPdf(document)}>
-                    <FileDown size={16} />
-                  </button>
-                </article>
-              ))}
+              {documentGroups.some((group) => group.documents.length > 0) && visibleDocumentGroups.length === 0 && (
+                <div className="empty-card">No documents match that search.</div>
+              )}
             </div>
           </section>
         )}
@@ -7301,6 +7602,9 @@ export default function App() {
                   onChange={() => {
                     setNewConversationMode("agentic");
                     setNewConversationSingleCharacterId(null);
+                    if (config?.active_model?.id) {
+                      setNewAgenticDirectorModelId(config.active_model.id);
+                    }
                     if (!newConversationParticipants.length && config?.models.length) {
                       setNewConversationParticipants([createParticipantDraft(config.models)]);
                     }
@@ -7348,6 +7652,22 @@ export default function App() {
             {newConversationMode === "agentic" && config?.models.length ? (
               <>
                 <div className="agentic-setup-grid">
+                  <label className="agentic-director-model-field">
+                    Director model
+                    <select
+                      value={newAgenticDirectorModelId ?? config.active_model.id ?? ""}
+                      onChange={(event) => setNewAgenticDirectorModelId(Number(event.target.value))}
+                    >
+                      {config.models.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.model} ({model.provider})
+                        </option>
+                      ))}
+                    </select>
+                    <span className="agentic-scrape-depth-help">
+                      The Director orchestrates specialists and chooses tools. Specialist models are configured below.
+                    </span>
+                  </label>
                   <label>
                     Goal
                     <textarea
@@ -7419,12 +7739,36 @@ export default function App() {
                     />
                   </label>
                   <label className="agentic-input-document-field">
-                    Paste input document (optional)
+                    <span className="agentic-input-document-label-row">
+                      <span>Paste input document (optional)</span>
+                      <button type="button" className="secondary-button" onClick={() => void openExistingDocumentModal()}>
+                        <FileText size={16} />
+                        Existing
+                      </button>
+                    </span>
+                    {selectedExistingInputDocument && (
+                      <span className="agentic-existing-document-selection">
+                        Existing document selected: {selectedExistingInputDocument.document.title} from{" "}
+                        {selectedExistingInputDocument.conversation.title}
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => setSelectedExistingInputDocument(null)}
+                        >
+                          Clear
+                        </button>
+                      </span>
+                    )}
                     <textarea
                       value={newAgenticInputDocumentContent}
-                      onChange={(event) => setNewAgenticInputDocumentContent(event.target.value)}
+                      onChange={(event) => {
+                        setNewAgenticInputDocumentContent(event.target.value);
+                        if (event.target.value.trim()) {
+                          setSelectedExistingInputDocument(null);
+                        }
+                      }}
                       placeholder="Paste Markdown, notes, source material, requirements, or other context for the Director..."
-                      rows={8}
+                      rows={2}
                     />
                     <span className="agentic-scrape-depth-help">
                       Saved as a conversation document before the Director starts.
@@ -7458,6 +7802,69 @@ export default function App() {
         </div>
       )}
 
+      {isExistingDocumentModalOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={() => setIsExistingDocumentModalOpen(false)}
+        >
+          <div
+            className="modal-card existing-document-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="existing-document-modal-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div>
+              <p className="eyebrow">Input document</p>
+              <h2 id="existing-document-modal-title">Choose existing document</h2>
+              <p className="modal-copy">
+                Documents are sorted by discussion, document title, and creation date.
+              </p>
+            </div>
+            <div className="existing-document-table" role="table" aria-label="Existing documents">
+              <div className="existing-document-row existing-document-header" role="row">
+                <span role="columnheader">Discussion</span>
+                <span role="columnheader">Document title</span>
+                <span role="columnheader">Date created</span>
+              </div>
+              {loadingExistingDocuments ? (
+                <div className="existing-document-empty">
+                  <Loader2 size={16} className="spin" />
+                  Loading documents...
+                </div>
+              ) : existingDocumentOptions.length ? (
+                existingDocumentOptions.map((option) => (
+                  <button
+                    type="button"
+                    key={`${option.conversation.id}-${option.document.id}`}
+                    className="existing-document-row existing-document-choice"
+                    role="row"
+                    onClick={() => {
+                      setSelectedExistingInputDocument(option);
+                      setNewAgenticInputDocumentTitle("");
+                      setNewAgenticInputDocumentContent("");
+                      setIsExistingDocumentModalOpen(false);
+                    }}
+                  >
+                    <span role="cell">{option.conversation.title}</span>
+                    <span role="cell">{option.document.title}</span>
+                    <span role="cell">{formatDate(option.document.created_at)}</span>
+                  </button>
+                ))
+              ) : (
+                <div className="existing-document-empty">No existing documents found.</div>
+              )}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={() => setIsExistingDocumentModalOpen(false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {(isCreatingAgentProfile || editingAgentProfile) && agentProfileEditDraft && config?.models.length && (
         <div className="modal-backdrop" role="presentation" onMouseDown={closeAgentProfileEditor}>
           <form
@@ -7481,7 +7888,7 @@ export default function App() {
               agentProfiles={agentProfiles}
               ttsVoiceOptions={ttsVoiceOptions}
               onPlayVoiceSample={playModelVoiceSample}
-              onGeneratePersonality={generateAgentPersonalityDraft}
+              onGeneratePersonality={openAgentPersonalityModelModal}
               generatingPersonality={generatingAgentPersonality}
               expandedPersonality
             />
@@ -7518,10 +7925,27 @@ export default function App() {
               <p className="eyebrow">Agentic conversation</p>
               <h2>Edit setup</h2>
               <p className="modal-copy">
-                Changes apply to the next director run. Existing director steps and agent replies stay unchanged.
+                Saving updates setup and launches the Director with these settings. Existing director steps and agent
+                replies stay unchanged.
               </p>
             </div>
             <div className="agentic-setup-grid">
+              <label className="agentic-director-model-field">
+                Director model
+                <select
+                  value={newAgenticDirectorModelId ?? config.active_model.id ?? ""}
+                  onChange={(event) => setNewAgenticDirectorModelId(Number(event.target.value))}
+                >
+                  {config.models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.model} ({model.provider})
+                    </option>
+                  ))}
+                </select>
+                <span className="agentic-scrape-depth-help">
+                  The Director orchestrates specialists and chooses tools. Specialist models are configured below.
+                </span>
+              </label>
               <label>
                 Goal
                 <textarea
@@ -7602,16 +8026,16 @@ export default function App() {
               <button type="button" className="secondary-button" onClick={() => setIsAgenticSetupModalOpen(false)}>
                 Cancel
               </button>
-              <button type="submit" disabled={savingAgenticSetup}>
+              <button type="submit" disabled={savingAgenticSetup || activeConversationGenerating}>
                 {savingAgenticSetup ? (
                   <>
                     <Loader2 size={16} className="spin" />
-                    Saving...
+                    Launching...
                   </>
                 ) : (
                   <>
                     <Save size={16} />
-                    Save setup
+                    Save and launch
                   </>
                 )}
               </button>
@@ -7676,6 +8100,12 @@ export default function App() {
                   This conversation also has {deleteMemoryCount} saved {deleteMemoryCount === 1 ? "memory" : "memories"}.
                 </>
               )}
+              {deleteDocumentCount > 0 && (
+                <>
+                  {" "}
+                  It also has {deleteDocumentCount} {deleteDocumentCount === 1 ? "document" : "documents"}.
+                </>
+              )}
             </p>
 
             {deleteMemoryCount > 0 && (
@@ -7715,11 +8145,52 @@ export default function App() {
               </div>
             )}
 
+            {deleteDocumentCount > 0 && (
+              <div className="delete-options">
+                <label>
+                  <input
+                    type="radio"
+                    name="document-delete-action"
+                    checked={deleteDocumentAction === "move"}
+                    disabled={!deleteDestinationConversations.length}
+                    onChange={() => setDeleteDocumentAction("move")}
+                  />
+                  Move documents to another conversation
+                </label>
+                {deleteDocumentAction === "move" && (
+                  <select
+                    value={deleteTargetId}
+                    disabled={!deleteDestinationConversations.length}
+                    onChange={(event) => setDeleteTargetId(Number(event.target.value))}
+                  >
+                    {deleteDestinationConversations.map((conversation) => (
+                      <option key={conversation.id} value={conversation.id}>
+                        {conversation.title}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <label>
+                  <input
+                    type="radio"
+                    name="document-delete-action"
+                    checked={deleteDocumentAction === "delete"}
+                    onChange={() => setDeleteDocumentAction("delete")}
+                  />
+                  Delete documents too
+                </label>
+              </div>
+            )}
+
             <div className="modal-actions">
               <button type="button" className="secondary-button" onClick={() => setDeleteConversationTarget(null)}>
                 Cancel
               </button>
-              <button type="submit" className="danger-button" disabled={deleteMemoryAction === "move" && !deleteTargetId}>
+              <button
+                type="submit"
+                className="danger-button"
+                disabled={(deleteMemoryAction === "move" || deleteDocumentAction === "move") && !deleteTargetId}
+              >
                 <Trash2 size={16} />
                 Delete conversation
               </button>
@@ -7860,9 +8331,13 @@ export default function App() {
         >
           <div className="modal-card model-picker-modal" onMouseDown={(event) => event.stopPropagation()}>
             <div>
-              <p className="eyebrow">Discussion model</p>
+              <p className="eyebrow">{isAgenticConversation ? "Director model" : "Discussion model"}</p>
               <h2 id="conversation-model-modal-title">Choose a model</h2>
-              <p className="modal-copy">Pick the model for new replies in this conversation.</p>
+              <p className="modal-copy">
+                {isAgenticConversation
+                  ? "Pick the model the Director uses to plan, delegate, and evaluate."
+                  : "Pick the model for new replies in this conversation."}
+              </p>
             </div>
 
             <div className="model-picker-list">
@@ -7908,6 +8383,87 @@ export default function App() {
             <div className="modal-actions">
               <button type="button" className="secondary-button" onClick={() => setIsConversationModelModalOpen(false)}>
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isAgentPersonalityModelModalOpen && config && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="agent-personality-model-modal-title"
+          onMouseDown={closeAgentPersonalityModelModal}
+        >
+          <div className="modal-card model-picker-modal" onMouseDown={(event) => event.stopPropagation()}>
+            <div>
+              <p className="eyebrow">Agent draft</p>
+              <h2 id="agent-personality-model-modal-title">Choose an LLM</h2>
+              <p className="modal-copy">
+                Pick which configured model should draft the personality / perspective for this agent.
+              </p>
+            </div>
+
+            <div className="model-picker-list">
+              {config.models.map((model) => {
+                const isSelected = model.id === agentPersonalityModelId;
+                const isDefault = model.id === config.active_model.id;
+                return (
+                  <label
+                    className={`model-picker-item model-picker-choice ${isSelected ? "model-picker-item-current" : ""}`}
+                    key={model.id}
+                  >
+                    <input
+                      type="radio"
+                      name="agent-personality-model"
+                      checked={isSelected}
+                      disabled={generatingAgentPersonality}
+                      onChange={() => setAgentPersonalityModelId(model.id ?? null)}
+                    />
+                    <div className="model-picker-item-body">
+                      <div className="model-picker-item-header">
+                        <strong>{model.model}</strong>
+                        {isDefault && <span className="model-picker-current-badge">Default</span>}
+                      </div>
+                      <p className="model-picker-item-provider">{model.provider}</p>
+                      <p className="model-picker-item-comment">
+                        {model.comments?.trim()
+                          ? model.comments
+                          : "No notes added for this model yet. Add them in Config → Model settings."}
+                      </p>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={generatingAgentPersonality}
+                onClick={closeAgentPersonalityModelModal}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={generatingAgentPersonality || agentPersonalityModelId == null}
+                onClick={() => void generateAgentPersonalityDraft()}
+              >
+                {generatingAgentPersonality ? (
+                  <>
+                    <Loader2 size={16} className="spin" />
+                    Drafting...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles size={16} />
+                    Proceed
+                  </>
+                )}
               </button>
             </div>
           </div>
@@ -7970,6 +8526,41 @@ export default function App() {
                 <span className="llm-progress-provider">{progressModalJob.conversationTitle}</span>
               </div>
             </div>
+
+            {progressModalJob.scrapeProgress && (
+              <div className="agentic-scrape-progress">
+                <div>
+                  <span>Analyzing page</span>
+                  <strong title={progressModalJob.scrapeProgress.current_url}>
+                    {progressModalJob.scrapeProgress.current_url ?? "Website page"}
+                  </strong>
+                </div>
+                <dl>
+                  <div>
+                    <dt>Pages</dt>
+                    <dd>{progressModalJob.scrapeProgress.pages_scraped ?? 0}</dd>
+                  </div>
+                  <div>
+                    <dt>Queued</dt>
+                    <dd>{progressModalJob.scrapeProgress.queued_pages ?? 0}</dd>
+                  </div>
+                  <div>
+                    <dt>Characters</dt>
+                    <dd>{(progressModalJob.scrapeProgress.extracted_chars ?? 0).toLocaleString()}</dd>
+                  </div>
+                  <div>
+                    <dt>Rendered</dt>
+                    <dd>{progressModalJob.scrapeProgress.rendered_pages ?? 0}</dd>
+                  </div>
+                </dl>
+                {progressModalJob.scrapeProgress.last_page_chars != null && (
+                  <p>
+                    Last page extracted {progressModalJob.scrapeProgress.last_page_chars.toLocaleString()} characters
+                    {progressModalJob.scrapeProgress.used_rendered_dom ? " from rendered page content." : "."}
+                  </p>
+                )}
+              </div>
+            )}
 
             {progressModalAgentSteps.length > 0 && (
               <ol className="generation-agent-list" aria-label="Agents generating replies">
@@ -8219,8 +8810,45 @@ export default function App() {
         </section>
       )}
 
+      {isDocumentUploadTargetModalOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setIsDocumentUploadTargetModalOpen(false)}>
+          <div className="modal-card document-upload-target-modal" onMouseDown={(event) => event.stopPropagation()}>
+            <div>
+              <p className="eyebrow">Upload document</p>
+              <h2>Choose a discussion</h2>
+              <p className="modal-copy">Select where this document should be added. Most recent discussions are shown first.</p>
+            </div>
+            <div className="document-upload-target-list">
+              {documentUploadConversationOptions.map((conversation) => (
+                <button
+                  key={conversation.id}
+                  type="button"
+                  className={
+                    conversation.id === documentUploadTargetConversationId
+                      ? "document-upload-target-row document-upload-target-selected"
+                      : "document-upload-target-row"
+                  }
+                  onClick={() => chooseDocumentUploadTarget(conversation.id)}
+                >
+                  <strong>{conversation.title}</strong>
+                  <small>
+                    Updated {formatDate(conversation.updated_at)} · {conversation.participant_count ?? 0} participant
+                    {(conversation.participant_count ?? 0) === 1 ? "" : "s"}
+                  </small>
+                </button>
+              ))}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={() => setIsDocumentUploadTargetModalOpen(false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {selectedDocument && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setSelectedDocument(null)}>
+        <div className="modal-backdrop document-viewer-backdrop" role="presentation" onMouseDown={() => setSelectedDocument(null)}>
           <div className="modal-card document-viewer-modal" onMouseDown={(event) => event.stopPropagation()}>
             <div className="document-viewer-header">
               <div>

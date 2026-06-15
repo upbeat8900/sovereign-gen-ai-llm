@@ -855,6 +855,20 @@ button {
   color: #1d4ed8;
 }
 
+.message-kind-director_delegation {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  border-left-color: #f97316;
+}
+
+.message-kind-director_delegation .message-meta strong {
+  color: #c2410c;
+}
+
+.message-kind-director_delegation .message-content {
+  color: #7c2d12;
+}
+
 .director-evaluation-meta,
 .director-document-actions {
   margin-top: 10px;
@@ -907,7 +921,7 @@ button {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 12px;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   padding: 12px 14px;
 }
 
@@ -922,14 +936,64 @@ button {
   text-align: left;
 }
 
-.document-viewer-modal {
+.document-delete-button {
+  color: #991b1b;
+}
+
+.document-delete-button:hover {
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+
+.document-upload-target-modal {
+  max-width: 680px;
+  width: min(100%, 680px);
+}
+
+.document-upload-target-list {
+  display: grid;
+  gap: 10px;
+  max-height: min(58vh, 520px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.document-upload-target-row {
+  align-items: start;
+  background: #f8fafc !important;
+  border: 1px solid #dbe3ef !important;
+  color: #0f172a !important;
+  display: grid !important;
+  gap: 4px;
+  justify-content: stretch !important;
+  text-align: left;
+}
+
+.document-upload-target-row:hover,
+.document-upload-target-selected {
+  background: #dbeafe !important;
+  border-color: #93c5fd !important;
+}
+
+.document-upload-target-row small {
+  color: #64748b;
+}
+
+.modal-backdrop.document-viewer-backdrop {
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 0;
+}
+
+.modal-card.document-viewer-modal {
+  border-radius: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
-  height: 80vh;
-  max-height: calc(100vh - 48px);
-  max-width: 80vw;
+  height: 100vh;
+  max-height: none;
+  max-width: none;
   overflow: hidden;
-  width: 80vw;
+  width: 100vw;
 }
 
 .document-viewer-body {
@@ -1451,11 +1515,16 @@ button {
 }
 
 .agentic-setup-modal .agentic-setup-grid input,
-.agentic-setup-modal .agentic-setup-grid textarea {
+.agentic-setup-modal .agentic-setup-grid textarea,
+.agentic-setup-modal .agentic-setup-grid select {
   box-sizing: border-box;
   font-weight: 400;
   min-width: 0;
   width: 100%;
+}
+
+.agentic-setup-modal .agentic-director-model-field {
+  grid-column: 1 / -1;
 }
 
 .agentic-setup-modal .agentic-scrape-depth-field {
@@ -1487,9 +1556,112 @@ button {
   grid-column: 1 / -1;
 }
 
+.agentic-input-document-label-row {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.agentic-input-document-label-row button {
+  flex-shrink: 0;
+}
+
+.agentic-existing-document-selection {
+  align-items: center;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 14px;
+  color: #1d4ed8;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+  font-weight: 600;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.agentic-existing-document-selection button {
+  margin-left: auto;
+  padding: 7px 10px !important;
+}
+
 .agentic-setup-modal .agentic-input-document-field textarea {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  min-height: 220px;
+  min-height: 0;
+}
+
+.existing-document-modal {
+  max-height: min(86vh, 760px);
+  max-width: 860px;
+  overflow: hidden;
+  width: min(100%, 860px);
+}
+
+.existing-document-table {
+  border: 1px solid #dbe3ef;
+  border-radius: 16px;
+  display: grid;
+  max-height: min(58vh, 520px);
+  overflow: auto;
+}
+
+.existing-document-row {
+  align-items: center;
+  border-bottom: 1px solid #e2e8f0;
+  display: grid !important;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.5fr) minmax(150px, 0.7fr);
+  padding: 12px 14px !important;
+  text-align: left;
+}
+
+.existing-document-row:last-child {
+  border-bottom: 0;
+}
+
+.existing-document-header {
+  background: #f8fafc;
+  color: #475569;
+  font-size: 0.82rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  position: sticky;
+  text-transform: uppercase;
+  top: 0;
+  z-index: 1;
+}
+
+.existing-document-choice {
+  background: #ffffff !important;
+  border-left: 0 !important;
+  border-right: 0 !important;
+  border-top: 0 !important;
+  color: #172033 !important;
+  cursor: pointer;
+  font-weight: 500 !important;
+  justify-content: stretch !important;
+}
+
+.existing-document-choice:hover {
+  background: #eff6ff !important;
+  color: #1d4ed8 !important;
+}
+
+.existing-document-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.existing-document-empty {
+  align-items: center;
+  color: #64748b;
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  padding: 18px;
 }
 
 .agentic-setup-modal .participant-editor {
@@ -1521,9 +1693,8 @@ button {
 }
 
 @media (max-width: 900px) {
-  .document-viewer-modal {
-    max-width: calc(100vw - 32px);
-    width: calc(100vw - 32px);
+  .modal-card.document-viewer-modal {
+    width: 100vw;
   }
 
   .document-website-upload {
@@ -2208,6 +2379,15 @@ button:disabled {
 .model-picker-item-current {
   background: #eff6ff;
   border-color: #bfdbfe;
+}
+
+.model-picker-choice {
+  cursor: pointer;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.model-picker-choice input {
+  margin-top: 4px;
 }
 
 .model-picker-item-body {
@@ -3262,6 +3442,49 @@ button:disabled {
   font-size: 12px;
   font-weight: 600;
   margin-top: 4px;
+}
+
+.agentic-scrape-progress {
+  background: #f8fafc;
+  border: 1px solid #dbe3ef;
+  border-radius: 16px;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.agentic-scrape-progress span,
+.agentic-scrape-progress dt,
+.agentic-scrape-progress p {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.agentic-scrape-progress strong {
+  color: #0f172a;
+  display: block;
+  margin-top: 2px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agentic-scrape-progress dl {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+
+.agentic-scrape-progress dd {
+  color: #0f172a;
+  font-weight: 800;
+  margin: 0;
+}
+
+.agentic-scrape-progress p {
+  margin: 0;
 }
 
 .generation-agent-list {

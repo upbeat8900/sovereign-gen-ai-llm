@@ -78,6 +78,7 @@ from .models import (
     CrossConversationMemoryMerge,
     Document,
     DocumentCreate,
+    DocumentGroup,
     DocumentUpdate,
     DocumentUploadResponse,
     DocumentWebsiteUploadRequest,
@@ -155,6 +156,8 @@ def _public_conversation(connection, conversation_id: int) -> dict:
     conversation["mode"] = (conversation.get("mode") or "single").strip() or "single"
     if conversation["mode"] == "agentic" and not conversation.get("agentic_status"):
         conversation["agentic_status"] = "idle"
+    progress_json = conversation.pop("agentic_progress_json", None)
+    conversation["agentic_progress"] = json.loads(progress_json) if progress_json else None
     return conversation
 
 
@@ -1122,7 +1125,11 @@ def draft_agent_personality(payload: AgentPersonalityDraftCreate) -> dict:
     ]
 
     with get_connection() as connection:
-        config = _active_llm_model(connection)
+        config = (
+            _llm_model_or_404(connection, payload.llm_model_id)
+            if payload.llm_model_id is not None
+            else _active_llm_model(connection)
+        )
         context_chars = sum(len(str(message.get("content", ""))) for message in messages)
         started_at = time.perf_counter()
         try:
@@ -1148,7 +1155,7 @@ def draft_agent_personality(payload: AgentPersonalityDraftCreate) -> dict:
             )
 
     if not personality:
-        raise HTTPException(status_code=502, detail="The default LLM returned an empty draft")
+        raise HTTPException(status_code=502, detail="The selected LLM returned an empty draft")
     return {"personality": personality}
 
 
@@ -1355,6 +1362,8 @@ def list_conversations() -> List[dict]:
                 (conversation["id"],),
             ).fetchone()["count"]
             conversation["participant_count"] = int(count)
+            progress_json = conversation.pop("agentic_progress_json", None)
+            conversation["agentic_progress"] = json.loads(progress_json) if progress_json else None
             result.append(conversation)
         return result
 
@@ -1365,6 +1374,10 @@ def create_conversation(payload: ConversationCreate) -> dict:
     mode = payload.mode or "single"
     with get_connection() as connection:
         active_model = _active_llm_model(connection)
+        director_model_id = active_model["id"]
+        if payload.llm_model_id is not None:
+            _llm_model_or_404(connection, payload.llm_model_id)
+            director_model_id = payload.llm_model_id
         next_sort_order = connection.execute(
             "SELECT COALESCE(MIN(sort_order), 0) - 1 AS sort_order FROM conversations"
         ).fetchone()["sort_order"]
@@ -1379,7 +1392,7 @@ def create_conversation(payload: ConversationCreate) -> dict:
             (
                 title,
                 next_sort_order,
-                active_model["id"],
+                director_model_id,
                 mode,
                 (payload.agentic_goal or "").strip() or None,
                 (payload.agentic_success_criteria or "").strip() or None,
@@ -1484,13 +1497,21 @@ def delete_conversation(conversation_id: int, payload: ConversationDelete) -> di
     with get_connection() as connection:
         _conversation_or_404(connection, conversation_id)
         memory_action = payload.memory_action.strip().lower()
+        document_action = payload.document_action.strip().lower()
 
-        if memory_action == "move":
+        if memory_action not in {"delete", "move"}:
+            raise HTTPException(status_code=400, detail="memory_action must be 'delete' or 'move'")
+        if document_action not in {"delete", "move"}:
+            raise HTTPException(status_code=400, detail="document_action must be 'delete' or 'move'")
+
+        if memory_action == "move" or document_action == "move":
             if payload.target_conversation_id is None:
-                raise HTTPException(status_code=400, detail="Choose a destination conversation for memories")
+                raise HTTPException(status_code=400, detail="Choose a destination conversation")
             if payload.target_conversation_id == conversation_id:
                 raise HTTPException(status_code=400, detail="Destination conversation must be different")
             _conversation_or_404(connection, payload.target_conversation_id)
+
+        if memory_action == "move":
             connection.execute(
                 """
                 UPDATE memories
@@ -1499,12 +1520,22 @@ def delete_conversation(conversation_id: int, payload: ConversationDelete) -> di
                 """,
                 (payload.target_conversation_id, conversation_id),
             )
+
+        if document_action == "move":
+            connection.execute(
+                """
+                UPDATE documents
+                SET conversation_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE conversation_id = ?
+                """,
+                (payload.target_conversation_id, conversation_id),
+            )
+
+        if memory_action == "move" or document_action == "move":
             connection.execute(
                 "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (payload.target_conversation_id,),
             )
-        elif memory_action != "delete":
-            raise HTTPException(status_code=400, detail="memory_action must be 'delete' or 'move'")
 
         connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         return {"ok": True}
@@ -1583,10 +1614,12 @@ def update_agentic_conversation_setup(conversation_id: int, payload: Conversatio
             _llm_model_or_404,
             mode="agentic",
         )
+        _llm_model_or_404(connection, payload.llm_model_id)
         connection.execute(
             """
             UPDATE conversations
             SET
+                llm_model_id = ?,
                 agentic_goal = ?,
                 agentic_success_criteria = ?,
                 agentic_scrape_url = ?,
@@ -1597,6 +1630,7 @@ def update_agentic_conversation_setup(conversation_id: int, payload: Conversatio
             WHERE id = ?
             """,
             (
+                payload.llm_model_id,
                 payload.agentic_goal.strip(),
                 payload.agentic_success_criteria.strip(),
                 (payload.agentic_scrape_url or "").strip() or None,
@@ -1735,7 +1769,17 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
         if conversation_mode == "agentic":
             status = (conversation.get("agentic_status") or "idle").strip()
             if status in {"running", "wrap_requested", "stop_requested"}:
-                raise HTTPException(status_code=400, detail="Agentic process is already running")
+                if payload.agentic_start:
+                    raise HTTPException(status_code=400, detail="Agentic process is already running")
+                connection.execute(
+                    """
+                    UPDATE conversations
+                    SET agentic_status = 'idle', agentic_progress_json = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (conversation_id,),
+                )
+                conversation["agentic_status"] = "idle"
             prompt_config = _prompt_config_or_default(connection)
             assistant_messages = run_agentic_turn(
                 connection,
@@ -1752,7 +1796,6 @@ def send_message(conversation_id: int, payload: MessageCreate, background_tasks:
                 llm_model_or_404=_llm_model_or_404,
                 active_memories_fn=_active_memories,
                 all_memories_fn=_all_active_memories,
-                insert_memory_fn=_insert_memory,
                 director_prompt_template=(prompt_config.get("director_prompt") or DEFAULT_DIRECTOR_PROMPT),
                 commit_connection=lambda conn: conn.commit(),
             )
@@ -2111,6 +2154,21 @@ def list_conversation_documents(conversation_id: int) -> List[dict]:
     with get_connection() as connection:
         _conversation_or_404(connection, conversation_id)
         return load_documents(connection, conversation_id)
+
+
+@app.get("/api/documents", response_model=List[DocumentGroup])
+def list_document_groups() -> List[dict]:
+    with get_connection() as connection:
+        conversations = connection.execute(
+            "SELECT * FROM conversations ORDER BY sort_order ASC, updated_at DESC, id DESC"
+        ).fetchall()
+        return [
+            {
+                "conversation": dict(conversation),
+                "documents": load_documents(connection, conversation["id"]),
+            }
+            for conversation in conversations
+        ]
 
 
 @app.post("/api/conversations/{conversation_id}/documents", response_model=Document)

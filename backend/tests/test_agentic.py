@@ -13,16 +13,27 @@ import pymupdf
 from backend.agentic import (
     _action_arguments,
     _agent_list_text,
+    _build_delegation_evidence,
+    _create_scrape_document,
+    _deliverable_title,
+    _extract_participant_id_from_action,
+    _fallback_evaluation,
     _fallback_success_score,
+    _generate_report_markdown,
     _is_repeated_delegation,
+    _matching_scrape_document,
     _looks_like_clarification_request,
+    _rank_participants_for_delegation,
     _repair_director_action,
+    _resolve_delegation_document_ids,
+    _resolve_deliverable_body,
     _runtime_action_guidance,
     _upsert_generated_document,
     build_director_prompt,
     build_sub_agent_prompt,
     parse_director_action,
 )
+from backend.database import _ensure_documents_kind_constraint
 from backend.documents import create_document, normalize_upload_to_markdown, search_documents
 from backend.multi_agent import validate_participant_payloads
 from backend.scrape import _extract_readable_structure, scrape_website_content
@@ -45,6 +56,7 @@ class AgenticHelpersTest(unittest.TestCase):
         self.assertIn("Summarize risks", prompt)
         self.assertIn("Data specialist", prompt)
         self.assertNotIn("roundtable", prompt.lower())
+        self.assertIn("If the Director is responding to a clarification question", prompt)
 
     def test_build_director_prompt_renders_placeholders(self):
         prompt = build_director_prompt(
@@ -69,6 +81,72 @@ class AgenticHelpersTest(unittest.TestCase):
         self.assertIn("No documents are currently available", guidance)
         self.assertIn("Do not use search_documents or read_document", guidance)
         self.assertIn("Valid participant_id values for call_agent: 7", guidance)
+        self.assertIn("document_ids", guidance)
+        self.assertIn("generate_report must store the actual user-facing deliverable", guidance)
+
+    def test_resolve_delegation_document_ids_from_task_and_arguments(self):
+        documents = [
+            {"id": 3, "title": "Project Requirements", "kind": "uploaded", "content_markdown": "Req body"},
+            {"id": 9, "title": "Budget", "kind": "uploaded", "content_markdown": "Budget body"},
+        ]
+        resolved = _resolve_delegation_document_ids(
+            task="Review document 3 and summarize Project Requirements for executives.",
+            expected_output="Executive summary",
+            rationale="Need specialist review",
+            arguments={"document_ids": [9]},
+            documents=documents,
+        )
+        self.assertEqual(resolved, [9, 3])
+
+    def test_build_delegation_evidence_includes_full_documents(self):
+        documents = [
+            {
+                "id": 3,
+                "title": "Project Requirements",
+                "kind": "uploaded",
+                "content_markdown": "A" * 7000,
+            }
+        ]
+        evidence, document_ids = _build_delegation_evidence(
+            last_result="Earlier scrape summary",
+            task="Analyze [3] and extract risks.",
+            expected_output="Risk list",
+            rationale="Delegate analysis",
+            arguments={},
+            documents=documents,
+        )
+        self.assertEqual(document_ids, [3])
+        self.assertIn("Full source documents for this task:", evidence)
+        self.assertIn("A" * 7000, evidence)
+        self.assertIn("Earlier scrape summary", evidence)
+
+    def test_resolve_deliverable_body_prefers_specialist_output(self):
+        steps = [
+            {"message_kind": "director_evaluation", "content": "Success score is 72% because..."},
+            {
+                "message_kind": "agent_reply",
+                "content": "Here is the LinkedIn post draft with hook and CTA.",
+            },
+        ]
+        body = _resolve_deliverable_body(steps=steps, final_answer="Success score is 72% because...")
+        self.assertIn("LinkedIn post draft", body)
+        self.assertNotIn("Success score is 72%", body)
+
+    def test_generate_report_markdown_leads_with_deliverable(self):
+        markdown = _generate_report_markdown(
+            title="Deliverable - LinkedIn post",
+            format_request="Social post",
+            goal="Write LinkedIn copy",
+            success_criteria="Ready to publish",
+            deliverable_body="Hook line\n\nBody copy\n\nCTA",
+            director_summary="Specialist produced a usable draft.",
+            documents=[],
+            memories_used=[],
+            documents_used=[],
+        )
+        self.assertLess(markdown.index("Hook line"), markdown.index("## Goal"))
+        self.assertIn("Hook line", markdown)
+        self.assertNotIn("## Process highlights", markdown)
 
     def test_agent_list_includes_roles_and_ids(self):
         roster = _agent_list_text(
@@ -87,6 +165,10 @@ class AgenticHelpersTest(unittest.TestCase):
 
     def test_action_arguments_normalizes_non_dict(self):
         self.assertEqual(_action_arguments({"arguments": "participant_id=1"}), {})
+
+    def test_deliverable_title_prefix(self):
+        self.assertEqual(_deliverable_title("Blog post"), "Deliverable - Blog post")
+        self.assertEqual(_deliverable_title("Deliverable - Blog post"), "Deliverable - Blog post")
 
     def test_detects_agent_clarification_request(self):
         self.assertTrue(_looks_like_clarification_request("Could you clarify which audience this report targets?"))
@@ -111,8 +193,16 @@ class AgenticHelpersTest(unittest.TestCase):
             "Here is a draft LinkedIn post with a hook, call to action, and suggested assumptions for educators."
             " It includes concrete messaging and a meeting-booking ask."
         )
-        self.assertGreater(score, 0)
+        self.assertGreater(score, 35)
         self.assertEqual(_fallback_success_score("Could you clarify the target audience?"), 5)
+
+    def test_fallback_evaluation_explains_percentage(self):
+        evaluation = _fallback_evaluation(
+            "Here is a complete draft blog post with a CTA and recommendation.",
+            "The draft is useful but needs validation.",
+        )
+        self.assertIn("%", evaluation["assessment"])
+        self.assertIn(str(evaluation["success_score"]), evaluation["assessment"])
 
     def test_repair_director_action_defaults_only_participant(self):
         repaired, repairs = _repair_director_action(
@@ -142,7 +232,46 @@ class AgenticHelpersTest(unittest.TestCase):
             "Assess the website.",
         )
         self.assertEqual(repaired["arguments"]["participant_id"], 20)
-        self.assertTrue(any("Resolved participant_id" in repair for repair in repairs))
+        self.assertTrue(any("Resolved participant_id" in repair or "best-matching specialist" in repair for repair in repairs))
+
+    def test_repair_director_action_consults_when_no_clear_match(self):
+        repaired, repairs = _repair_director_action(
+            {
+                "action": "call_agent",
+                "rationale": "Delegate to the attached specialist with repaired action arguments.",
+                "arguments": {"task": "Write the final deliverable", "expected_output": "Completed artifact"},
+            },
+            [
+                {"id": 38, "name": "Writer", "personality": "Long-form essays"},
+                {"id": 39, "name": "Editor", "personality": "Copy editing and proofreading"},
+            ],
+            "Produce a polished blog post.",
+        )
+        self.assertEqual(repaired["action"], "consult_agents")
+        self.assertIn("question", repaired["arguments"])
+        self.assertTrue(any("consult" in repair.lower() for repair in repairs))
+
+    def test_extract_participant_id_from_top_level_action(self):
+        participant_id = _extract_participant_id_from_action(
+            {"action": "call_agent", "participant_id": 39, "arguments": {"task": "Edit copy"}},
+            [{"id": 38, "name": "Writer"}, {"id": 39, "name": "Editor"}],
+        )
+        self.assertEqual(participant_id, 39)
+
+    def test_rank_participants_for_delegation_prefers_role_match(self):
+        ranked = _rank_participants_for_delegation(
+            {
+                "action": "call_agent",
+                "arguments": {"task": "Draft LinkedIn copy with a strong hook"},
+            },
+            [
+                {"id": 38, "name": "Analyst", "personality": "Market research"},
+                {"id": 39, "name": "Copywriter", "personality": "LinkedIn and social copywriting"},
+            ],
+            "Create LinkedIn content.",
+        )
+        self.assertEqual(ranked[0][1], 39)
+        self.assertGreater(ranked[0][0], ranked[1][0])
 
 
 class DocumentsTest(unittest.TestCase):
@@ -214,6 +343,32 @@ class DocumentsTest(unittest.TestCase):
         self.assertEqual(len(docs), 1)
         self.assertEqual(docs[0]["title"], "Brief")
 
+    def test_agentic_scrape_content_is_stored_as_document_metadata(self):
+        scrape_result = {
+            "url": "https://example.com",
+            "query": None,
+            "depth": 1,
+            "pages_scraped": 1,
+            "page_urls": ["https://example.com"],
+            "rendered_pages": 0,
+            "render_errors": [],
+            "structure": [{"title": "Example"}],
+            "extracted_chars": 24,
+            "content_markdown": "# Example\n\nWebsite content",
+            "summary": "Website content",
+        }
+
+        document = _create_scrape_document(self.connection, 1, scrape_result)
+        match = _matching_scrape_document([document], "https://example.com", 1)
+
+        self.assertEqual(document["kind"], "uploaded")
+        self.assertEqual(document["source_filename"], "https://example.com")
+        self.assertIn("Website content", document["content_markdown"])
+        self.assertEqual(document["metadata"]["source"], "agentic_scrape_url")
+        self.assertEqual(document["metadata"]["url"], "https://example.com")
+        self.assertIsNone(document["metadata"]["query"])
+        self.assertEqual(match["id"], document["id"])
+
     def test_upsert_generated_report_keeps_one_active_report(self):
         first = _upsert_generated_document(
             self.connection,
@@ -266,6 +421,47 @@ class DocumentsTest(unittest.TestCase):
         counts = {row["kind"]: row["count"] for row in active_generated}
         self.assertEqual(counts["generated_report"], 1)
         self.assertEqual(counts["generated_process"], 1)
+
+
+class DatabaseMigrationTest(unittest.TestCase):
+    def test_documents_kind_constraint_accepts_generated_process(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT);
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('uploaded', 'generated_report')),
+                content_markdown TEXT NOT NULL,
+                source_filename TEXT,
+                source_media_type TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                archived_at TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
+            INSERT INTO conversations (id, title) VALUES (1, 'Test');
+            INSERT INTO documents (conversation_id, title, kind, content_markdown)
+            VALUES (1, 'Report', 'generated_report', 'Existing report');
+            """
+        )
+
+        _ensure_documents_kind_constraint(connection)
+        connection.execute(
+            """
+            INSERT INTO documents (conversation_id, title, kind, content_markdown)
+            VALUES (1, 'Process', 'generated_process', 'Rationale')
+            """
+        )
+
+        rows = connection.execute("SELECT kind, title FROM documents ORDER BY id").fetchall()
+        self.assertEqual([row["kind"] for row in rows], ["generated_report", "generated_process"])
+        self.assertEqual(rows[0]["title"], "Report")
+        connection.close()
 
 
 class ParticipantValidationTest(unittest.TestCase):

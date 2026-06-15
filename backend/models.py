@@ -83,6 +83,7 @@ class AgentProfileRead(BaseModel):
 class AgentPersonalityDraftCreate(BaseModel):
     name: str = Field(min_length=1)
     seed_personality: str = ""
+    llm_model_id: Optional[int] = None
 
 
 class AgentPersonalityDraftRead(BaseModel):
@@ -96,6 +97,7 @@ class ConversationParticipantsUpdate(BaseModel):
 
 class ConversationAgenticSetupUpdate(BaseModel):
     participants: List[ConversationParticipantUpdate] = Field(min_length=1)
+    llm_model_id: int
     agentic_goal: str = Field(min_length=1)
     agentic_success_criteria: str = Field(min_length=1)
     agentic_scrape_url: Optional[str] = None
@@ -115,6 +117,7 @@ class ConversationAgenticSetupUpdate(BaseModel):
 class ConversationCreate(BaseModel):
     title: Optional[str] = None
     mode: Literal["single", "discussion", "agentic"] = "single"
+    llm_model_id: Optional[int] = None
     participants: Optional[List[ConversationParticipantUpdate]] = None
     agentic_goal: Optional[str] = None
     agentic_success_criteria: Optional[str] = None
@@ -141,6 +144,7 @@ class ConversationTitleUpdate(BaseModel):
 
 class ConversationDelete(BaseModel):
     memory_action: str = "delete"
+    document_action: str = "delete"
     target_conversation_id: Optional[int] = None
 
 
@@ -170,6 +174,7 @@ class Conversation(BaseModel):
     agentic_report_format: Optional[str] = None
     agentic_status: Optional[str] = None
     agentic_max_iterations: Optional[int] = None
+    agentic_progress: Optional[dict] = None
     created_at: str
     updated_at: str
 
@@ -233,6 +238,11 @@ class Document(BaseModel):
     metadata: Optional[dict] = None
     created_at: str
     updated_at: str
+
+
+class DocumentGroup(BaseModel):
+    conversation: Conversation
+    documents: List[Document]
 
 
 class DocumentCreate(BaseModel):

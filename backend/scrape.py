@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import httpx
@@ -155,7 +155,12 @@ def _extract_readable_structure(html: str, url: str) -> tuple[str, dict]:
     return readable, {"title": title, "headings": headings[:30], "url": url}
 
 
-def scrape_website_content(url: str, query: Optional[str] = None, depth: int = 1) -> dict:
+def scrape_website_content(
+    url: str,
+    query: Optional[str] = None,
+    depth: int = 1,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+) -> dict:
 
     normalized_url = _validate_url(url)
     crawl_depth = max(1, min(3, int(depth or 1)))
@@ -173,6 +178,19 @@ def scrape_website_content(url: str, query: Optional[str] = None, depth: int = 1
             if current_url in visited:
                 continue
             visited.add(current_url)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "scraping",
+                        "status": "analyzing",
+                        "current_url": current_url,
+                        "current_depth": current_depth,
+                        "pages_scraped": len(page_results),
+                        "queued_pages": len(queue),
+                        "extracted_chars": sum(item["extracted_chars"] for item in page_results),
+                        "rendered_pages": rendered_pages,
+                    }
+                )
             response = client.get(current_url, headers=headers)
             response.raise_for_status()
             raw = response.content[:MAX_SCRAPE_BYTES]
@@ -201,6 +219,21 @@ def scrape_website_content(url: str, query: Optional[str] = None, depth: int = 1
                     "rendered": used_rendered_dom,
                 }
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "scraping",
+                        "status": "extracted",
+                        "current_url": current_url,
+                        "current_depth": current_depth,
+                        "pages_scraped": len(page_results),
+                        "queued_pages": len(queue),
+                        "last_page_chars": len(extracted),
+                        "extracted_chars": sum(item["extracted_chars"] for item in page_results),
+                        "rendered_pages": rendered_pages,
+                        "used_rendered_dom": used_rendered_dom,
+                    }
+                )
             if current_depth < crawl_depth:
                 for link in _extract_links(html, current_url, root_netloc):
                     if link not in visited and all(item[0] != link for item in queue):
